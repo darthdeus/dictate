@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# One renderer, private state, cached Nix runtime; no NixOS rebuild needed.
+# The runtime still requires nix-build with <nixpkgs> available.
+set -euo pipefail
+umask 077
+source_dir="$(dirname "$(readlink -f "$0")")/../lib/dictate-overlay"
+state_dir="${XDG_RUNTIME_DIR:-/tmp}/dictate-overlay-$UID"
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+script=overlay.py
+lock=renderer.lock
+case "${1:-}" in
+  --check) script=check.py; lock=check.lock ;;
+  --check-delivery) script=check_delivery.py; lock=check-delivery.lock ;;
+  "") ;;
+  *) echo "usage: dictate-overlay [--check|--check-delivery]" >&2; exit 1 ;;
+esac
+exec 9>"$state_dir/$lock"
+flock -n 9 || exit 0
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/dictate-overlay"
+mkdir -p "$cache"
+key="$(sha256sum "$source_dir/default.nix" | cut -c1-16)"
+runtime="$cache/runtime-$key"
+
+report_failure() {
+  local detail="$1"
+  local marker="$state_dir/failure-notified"
+  printf 'dictate-overlay: %s\n' "$detail" >&2
+  [ -e "$marker" ] && return 0
+  : >"$marker"
+  if command -v dunstify >/dev/null 2>&1; then
+    dunstify -u critical -a dictate "Dictate overlay unavailable" "$detail" >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical -a dictate "Dictate overlay unavailable" "$detail" >/dev/null 2>&1 || true
+  fi
+}
+
+if [ ! -x "$runtime/bin/dictate-overlay-python" ]; then
+  if ! nix-build "$source_dir/default.nix" --out-link "$runtime" >/dev/null; then
+    report_failure "could not build the Nix runtime; see the dictate state log"
+    exit 1
+  fi
+fi
+export GDK_BACKEND=x11 PYTHONDONTWRITEBYTECODE=1
+if "$runtime/bin/dictate-overlay-python" "$source_dir/$script" "$state_dir/state.json"; then
+  exit 0
+else
+  status=$?
+  report_failure "renderer exited with status $status; see the dictate state log"
+  exit "$status"
+fi

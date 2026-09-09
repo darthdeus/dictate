@@ -1,0 +1,14 @@
+# Copy this file to ~/.config/dictate/config.toml and customize it locally.
+# Do not commit the customized file: it may contain device names, private
+# vocabulary, local paths, or credentials.
+
+DICTATE_MIC = "auto"
+DICTATE_CHANNELS = 1
+DICTATE_CHAN = 0
+DICTATE_LANG = "auto"
+DICTATE_PROMPT = ""
+DICTATE_SERVER = "http://127.0.0.1:8127"
+DICTATE_STREAM = true
+DICTATE_HISTORY = true
+DICTATE_STYLE = false
+DICTATE_LLM = false

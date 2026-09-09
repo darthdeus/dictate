@@ -1,0 +1,1662 @@
+#!/usr/bin/env bash
+# dictate — hold-to-talk speech-to-text, transcribed locally by whisper.cpp and
+# typed into whatever window has focus.
+#
+# Chain: Caps Lock (held) --keyd--> F19 --sxhkd--> this script
+#        --pw-record--> multichannel raw pcm --ffmpeg--> 16kHz mono
+#        --whisper-server--> text --xdotool paste--> focused window
+#
+#   dictate start [llm]          begin recording (idempotent — safe under key
+#                                autorepeat); "llm" runs the optional cleanup
+#                                pass after transcription (see cleanup() below)
+#   dictate stop    stop, transcribe, type the result
+#   dictate toggle  start if idle, stop if recording (for tap-to-talk instead)
+#   dictate doctor  check every dependency and print what's wrong
+#   dictate timings [release] summarize preview or release-to-paste performance
+#   dictate level   record 5s and report peak/RMS dBFS with a verdict
+#   dictate meter   live bar meter until Ctrl-C
+#   dictate serve   run the resident whisper-server in the foreground
+#   dictate scan    per-channel levels, to find your mic on a multi-input interface
+#   dictate bench   run whisper and parakeet over the same clip and compare
+#   dictate history [n]          list recent saved dictations (default 20)
+#   dictate show [id|latest]     print one saved transcript and its audio path
+#   dictate retry [id|latest]    deliver a saved transcript to the focused window
+#
+# Config: ~/.config/dictate/config.toml; DICTATE_CONFIG overrides the path,
+#         DICTATE_CONFIG="" disables loading. Environment overrides config.
+# Env:   DICTATE_MIC     pipewire node/source (default: auto; configured in your profile)
+#        DICTATE_PW      0 to force ffmpeg's pulse capture instead of pw-record
+#        DICTATE_ENGINE  whisper | parakeet  (default whisper)
+#        DICTATE_CHANNELS source channel count, DICTATE_CHAN which one to use
+#        DICTATE_MODEL   ggml model path     (default ~/.local/share/whisper/ggml-large-v3-turbo.bin)
+#        DICTATE_SERVER  whisper-server url  (default http://127.0.0.1:8127; "" to force cli)
+#        DICTATE_LANG    whisper language    (default auto)
+#        DICTATE_PROMPT  recognition hints   (default: empty)
+#        DICTATE_THREADS whisper threads     (default 8)
+#        DICTATE_VAD     1 to re-enable VAD  (default 0 — it hurt accuracy, see below)
+#        DICTATE_MIN_PEAK dBFS silence gate  (default -45)
+#        DICTATE_NOTYPE  set to 1 to only put text on the clipboard, never type
+#        DICTATE_STREAM  live transcript notification while you hold the key
+#                        (default 1; needs the server, 0 to disable)
+#        DICTATE_STREAM_INTERVAL  target seconds between preview starts (default 0: no target)
+#        DICTATE_STREAM_PAUSE minimum pause after preview work (default 0.005)
+#        DICTATE_STREAM_GATE 0 to disable the simple preview silence gate
+#        DICTATE_STREAM_GATE_DB RMS threshold in dBFS (default -48)
+#        DICTATE_OSD_BACKEND gtk (default) | feh (legacy comparison)
+#        DICTATE_OSD_MOTION 0 to disable entrance and decorative animation
+#        DICTATE_OSD_WIDTH panel width in pixels (default 960)
+#        DICTATE_OSD_SIZE transcript font size in pixels (default 28)
+#        DICTATE_OSD_DONE_MS completion display time in milliseconds (default 1000)
+#        DICTATE_INPUT   auto | paste | type      (how text reaches the window)
+#        DICTATE_CLIPBOARD restore | keep         (restore your clipboard after)
+#        DICTATE_DIR     scratch audio dir   (default ~/.cache/dictate — real
+#                        disk, NOT tmpfs; see the RUNDIR/DATADIR note below)
+#        DICTATE_HISTORY  1 to retain audio + text history (default 1)
+#        DICTATE_HISTORY_DIR persistent history directory
+#                        (default ~/.local/state/dictate/history)
+#        DICTATE_HISTORY_DAYS delete entries older than this (default 30; 0=never)
+#        DICTATE_HISTORY_MAX keep at most this many entries (default 200; 0=unlimited)
+#        DICTATE_MAX_SECS hard cap on one capture (default 300)
+#        DICTATE_PASTE_KEY_DELAY seconds between shortcut key events (default 0.012)
+#
+# Logs:  ${XDG_STATE_HOME:-$HOME/.local/state}/dictate/dictate.log (private;
+#         verbose ffmpeg and whisper stderr land here)
+set -euo pipefail
+COMMAND_STARTED="${EPOCHREALTIME/,/.}"
+
+# Load trusted data, not shell code. Explicit environment values (including
+# empty strings) override the file; variable defaults below are the last layer.
+config_explicit="${DICTATE_CONFIG+x}"
+DICTATE_CONFIG="${DICTATE_CONFIG-${XDG_CONFIG_HOME:-$HOME/.config}/dictate/config.toml}"
+if [ -n "$DICTATE_CONFIG" ] && { [ -n "$config_explicit" ] || [ -e "$DICTATE_CONFIG" ] || [ -L "$DICTATE_CONFIG" ]; }; then
+  config_reader="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/dictate-overlay/config.py"
+  config_values="$(python3 "$config_reader" "$DICTATE_CONFIG")" || exit 1
+  if [ -n "$config_values" ]; then
+    while IFS=$'\t' read -r config_name config_value; do
+      if [ ! -v "$config_name" ]; then
+        export "$config_name=$config_value"
+      fi
+    done <<< "$config_values"
+  fi
+  unset config_reader config_values config_name config_value
+fi
+unset config_explicit
+
+# Two scratch locations, deliberately split by what the data *is*.
+#
+# RUNDIR is $XDG_RUNTIME_DIR — normally a tmpfs. Pidfiles belong there and only
+# pidfiles: they are small and MUST NOT survive a reboot, or a stale pid could
+# collide with a recycled process ID.
+#
+# DATADIR is real disk. Audio belongs there because a recorder that misses its
+# stop can grow without bound and exhaust a size-limited runtime filesystem.
+# Keeping captures on disk also makes failed deliveries recoverable.
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
+DATADIR="${DICTATE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dictate}"
+umask 077
+mkdir -p "$DATADIR"
+chmod 700 "$DATADIR"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dictate"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# History is user data, not a cache: losing it defeats its two purposes (recover
+# a transcript whose paste failed, and retain the exact audio that produced a
+# bad transcript). Keep it private and bounded by both age and entry count.
+HISTORY_ENABLED="${DICTATE_HISTORY:-1}"
+HISTORY_DIR="${DICTATE_HISTORY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dictate/history}"
+HISTORY_DAYS="${DICTATE_HISTORY_DAYS:-30}"
+HISTORY_MAX="${DICTATE_HISTORY_MAX:-200}"
+HISTORY_READY=0
+if [ "$HISTORY_ENABLED" = "1" ]; then
+  if mkdir -p "$HISTORY_DIR" && chmod 700 "$HISTORY_DIR"; then
+    HISTORY_READY=1
+  else
+    echo "warning: dictation history unavailable at $HISTORY_DIR" >&2
+  fi
+fi
+
+PIDFILE="$RUNDIR/dictate.pid"
+STARTFILE="$RUNDIR/dictate.started"
+WAV="$DATADIR/dictate.wav"
+WAV_PROC="$DATADIR/dictate-proc.wav"
+RAW="$DATADIR/dictate-raw.pcm"  # headerless multichannel capture (see cap_bg)
+LOG="$STATE_DIR/dictate.log"
+RELEASE_TIMING="$DATADIR/dictate-release-timing.tsv"
+RELEASE_TIMING_ACTIVE=0
+
+release_mark() {
+  [ "$RELEASE_TIMING_ACTIVE" = 1 ] || return 0
+  # Builtins only: don't add a process launch to every measured stage.
+  printf '%s\t%s\n' "$1" "${2:-${EPOCHREALTIME/,/.}}" >>"$RELEASE_TIMING" || true
+}
+
+# "auto" uses the desktop's default input. Device-specific settings belong
+# in the personal profile, not in the reusable command.
+MIC="${DICTATE_MIC:-auto}"
+PULSE_MIC="$MIC"
+[ "$MIC" = auto ] && PULSE_MIC="@DEFAULT_SOURCE@"
+MODEL="${DICTATE_MODEL:-$HOME/.local/share/whisper/ggml-large-v3-turbo.bin}"
+
+# Which ASR to use: "whisper" or "parakeet". Compare them on your own audio with
+# `dictate bench`; the result depends on the model, microphone, and recording.
+ENGINE="${DICTATE_ENGINE:-whisper}"
+PARAKEET_MODEL="${DICTATE_PARAKEET_MODEL:-$HOME/.local/share/whisper/ggml-parakeet-tdt-0.6b-v3-f16.bin}"
+
+# Multichannel capture: some interfaces expose many inputs on one source and
+# ffmpeg's pulse backend silently defaults to 2 channels, so an input on a
+# higher channel can be invisible. Set CHANNELS to the source's real count and
+# CHAN to the 0-based channel your mic is on; `dictate scan` finds it for you.
+CHANNELS="${DICTATE_CHANNELS:-1}"
+CHAN="${DICTATE_CHAN:-0}"
+LANG_="${DICTATE_LANG:-auto}"
+THREADS="${DICTATE_THREADS:-8}"
+
+# Resident whisper-server. Model load dominates a one-shot whisper-cli run, so
+# keeping it warm avoids loading the model for every request. Falls back to
+# whisper-cli automatically when unreachable, so the server is an optimisation,
+# never a dependency.
+# ${x-default}, not ${x:-default}: an explicitly empty DICTATE_SERVER must mean
+# "force whisper-cli", which the colon form would silently override.
+SERVER="${DICTATE_SERVER-http://127.0.0.1:8127}"
+
+# VAD is OFF by default, deliberately. It can prevent silence hallucinations,
+# but chopping audio into speech segments can also remove context from quiet
+# input and hurt recognition. Silence is handled by MIN_PEAK plus the
+# NOISE_PHRASES blocklist below. Set DICTATE_VAD=1 to enable it.
+USE_VAD="${DICTATE_VAD:-0}"
+VAD_MODEL="${DICTATE_VAD_MODEL:-$HOME/.local/share/whisper/ggml-silero-v5.1.2.bin}"
+
+# Cheap replacement for VAD's one genuinely useful job: refusing to transcribe
+# a clip that is nothing but noise floor. Tune this threshold for the selected
+# microphone; it should reject true silence without rejecting quiet speech.
+# Free: it rides along on the filter pass that already runs.
+MIN_PEAK="${DICTATE_MIN_PEAK:--45}"
+
+# Gain staging: OFF by default. Audio preprocessing can make a waveform look
+# cleaner while moving it away from the distribution recognized by the model.
+# Test any filter against representative recordings before enabling it.
+#
+# Set DICTATE_FILTER to an ffmpeg -af chain to experiment. A useful one, if you
+# ever need it: "highpass=f=200,speechnorm=e=12.5:r=0.0001:l=1". Adjust it for
+# the acoustics and microphone in use.
+FILTER="${DICTATE_FILTER:-}"
+# Silero's speech/no-speech cut. Lower = more sensitive; raise if room noise
+# starts getting transcribed. This is the knob behind "no speech detected".
+VAD_THRESHOLD="${DICTATE_VAD_THRESHOLD:-0.5}"
+
+# Optional recognition vocabulary supplied by the user. Send it on each HTTP
+# request as well as CLI startup, so a resident server cannot keep stale hints.
+PROMPT="${DICTATE_PROMPT:-}"
+
+# Whole-string ERE of whisper's stock hallucinations, matched after lowercasing
+# and stripping punctuation. Extend freely — false positives here cost you one
+# re-dictation, a false negative types garbage into whatever has focus.
+NOISE_PHRASES="${DICTATE_NOISE:-you|thank you|thanks|thanks for watching|thank you for watching|bye|goodbye|okay|so|uh|um|hmm|mm|ah|oh|please subscribe|subtitles by the amaraorg community|amaraorg}"
+
+# Legacy optional cleanup, disabled unless explicitly configured. A future
+# post-processing interface will separate providers from the dictation core.
+MODEFILE="$RUNDIR/dictate.mode"
+LLM_CLEANUP="${DICTATE_LLM:-0}"
+LLM_URL="${DICTATE_LLM_URL:-}"
+LLM_MODEL="${DICTATE_LLM_MODEL:-}"
+LLM_TIMEOUT="${DICTATE_LLM_TIMEOUT:-15}"
+LLM_KEY="${DICTATE_LLM_KEY:-}"
+
+cleanup() {
+  # $1 = raw transcript. Prints the LLM-corrected text, or echoes $1 unchanged
+  # on ANY failure (missing key, timeout, non-JSON, empty reply). Never fails.
+  local text="$1"
+  [ "$LLM_CLEANUP" = "1" ] || { printf '%s' "$text"; return; }
+  [ -n "$LLM_KEY" ] || { echo "note: no explicitly configured cleanup key, skipping llm cleanup" >>"$LOG"; printf '%s' "$text"; return; }
+  local out
+  out="$(jq -n --arg m "$LLM_MODEL" --arg p "$PROMPT" --arg t "$text" '{
+    model: $m, temperature: 0.0, max_tokens: 2048,
+    thinking: {type: "enabled", effort: "low"},
+    messages: [
+      {role: "system", content:
+        ("You fix speech-to-text transcripts of a software developer dictating. " +
+         "Correct misrecognized technical terms, fix spelling and punctuation. " +
+         "Only change a word when you are CERTAIN it is a misrecognition of " +
+         "known vocabulary or an obvious speech-to-text error; otherwise copy " +
+         "it exactly. Project-specific terms and names are usually correct - " +
+         "do not fix them. Never change the wording, never add or remove " +
+         "content, never answer or comment. Output ONLY the corrected text, " +
+         "nothing else. " +
+         "Known vocabulary: " + $p)},
+      {role: "user", content: $t}
+    ]}' | curl -sf --connect-timeout 2 --max-time "$LLM_TIMEOUT" "$LLM_URL" \
+        -H "Authorization: Bearer $LLM_KEY" -H "Content-Type: application/json" \
+        -d @- 2>>"$LOG" | jq -er '.choices[0].message.content' 2>>"$LOG")" \
+    || { echo "note: llm cleanup failed/timed out, keeping raw text" >>"$LOG"; printf '%s' "$text"; return; }
+  out="${out#"${out%%[![:space:]]*}"}"; out="${out%"${out##*[![:space:]]}"}"
+  [ -n "$out" ] && printf '%s' "$out" || printf '%s' "$text"
+}
+
+# --- legacy image overlay (DICTATE_OSD_BACKEND=feh) -----------------------------
+# The optional feh backend renders feedback as one centered overlay
+# rather than a dunst corner notification — dunst's origin/geometry is
+# global-only (no per-app-name rule for it), so this is the one piece of
+# feedback that would otherwise have to drag every OTHER notification on the
+# system to the middle of the screen with it.
+#
+# xosd (osd_cat) was tried first — it is the obvious lightweight choice for a
+# focus-preserving centered overlay — but this xosd build has no background/
+# box primitive at all (confirmed against its actual option list: colour,
+# shadow and outline only), so text over a busy window was often unreadable.
+# feh renders a plain PNG without stealing focus (i3's no_focus rule below
+# still applies, since feh is a real managed window, just an unfocused one), so
+# a tiny ImageMagick pass composites text over a rounded panel and feh displays
+# it.
+#
+# The window itself is opened ONCE per dictation and left running: killing
+# and respawning feh for every update (the first version of this did exactly
+# that) destroys and remaps the X window each time, which reads as a visible
+# blink on every live-preview tick. feh has built-in inotify auto-reload of
+# its current image with no flag needed (only `--reload N` disables it in
+# favour of polling), so instead later calls just atomically replace the PNG
+# in place — `mv` onto the existing path, never edited in place, so feh never
+# catches a half-written file — and feh redraws the same window with the new
+# pixels. The canvas size is fixed (OSD_W x OSD_H) for the same reason: a
+# window that resizes to hug shorter/longer text remaps just like a respawn
+# would. A generation counter, bumped on every call and checked by that
+# call's own sleep-then-check backgrounded job, is what lets the window
+# finally close after the LAST message's timeout without an earlier
+# message's stale timer closing it prematurely.
+#
+# i3/config has: no_focus + floating/borderless/sticky for class dictate-osd.
+OSD_DONE_MS="${DICTATE_OSD_DONE_MS:-1000}"
+OSD_PIDFILE="$RUNDIR/dictate-osd.pid"
+OSD_GEN="$RUNDIR/dictate-osd.gen"
+OSD_CAP="$DATADIR/dictate-osd-cap.png"
+OSD_BG_PNG="$DATADIR/dictate-osd-bg.png"
+OSD_PNG="$DATADIR/dictate-osd-final.png"
+OSD_PNG_TMP="$DATADIR/dictate-osd-final.tmp.png"
+OSD_FONT="${DICTATE_OSD_FONT:-DejaVu-Sans-Bold}"
+OSD_SIZE="${DICTATE_OSD_SIZE:-30}"
+OSD_FG="${DICTATE_OSD_FG:-#39ff88}"
+OSD_BG="${DICTATE_OSD_BG:-rgba(15,15,25,0.85)}"
+OSD_W="${DICTATE_OSD_WIDTH:-1000}"
+OSD_H="${DICTATE_OSD_HEIGHT:-220}"
+OSD_PAD=28
+OSD_RADIUS=22
+OSD_SLIDE_DROP="${DICTATE_OSD_SLIDE_DROP:-46}"   # px above resting position to start from
+OSD_SLIDE_STEPS="${DICTATE_OSD_SLIDE_STEPS:-14}"
+OSD_SLIDE_STEP_DELAY="${DICTATE_OSD_SLIDE_STEP_DELAY:-0.012}"
+
+# Close the overlay window entirely. Only called once nothing is due to
+# replace it (see the generation check in osd_show) — never between two
+# updates in the same dictation, or every update would blink like a respawn.
+osd_kill() {
+  [ -s "$OSD_PIDFILE" ] || return 0
+  kill "$(cat "$OSD_PIDFILE")" 2>/dev/null || true
+  rm -f "$OSD_PIDFILE" "$OSD_GEN"
+}
+
+osd_ensure_window() {
+  [ -s "$OSD_PIDFILE" ] && kill -0 "$(cat "$OSD_PIDFILE")" 2>/dev/null && return 0
+  local sw sh x y y0 wid i frac yy
+  # The real X screen (all monitors), not xdotool's Xinerama-scoped notion of
+  # one.
+  read -r sw sh < <(xdpyinfo 2>/dev/null | awk -F'[ x]+' '/dimensions:/{print $3, $4}')
+  [ -n "$sw" ] || { sw=1920; sh=1080; }
+  x=$(((sw - OSD_W) / 2)); y=$(((sh - OSD_H) / 2))
+  y0=$((y - OSD_SLIDE_DROP))
+  # -D and --on-last-slide hold are just a backstop in case a crash somewhere
+  # skips the generation-timer cleanup below; normal closing goes through
+  # osd_kill, not this timeout.
+  feh --class dictate-osd -x -g "${OSD_W}x${OSD_H}+${x}+${y0}" -D 600 --on-last-slide hold \
+    "$OSD_PNG" >>"$LOG" 2>&1 &
+  echo $! >"$OSD_PIDFILE"
+
+  # Ease the window down into its resting spot instead of popping in fully
+  # formed. The renderer does not require a compositor, so a real opacity fade
+  # is not assumed: an X window is either mapped or it isn't.
+  # Plain X11 window moves don't need one though, and only run ONCE per
+  # dictation, right here at window creation — every later content update
+  # still goes through osd_show's in-place PNG swap untouched, so the
+  # fluid-update fix from before is unaffected.
+  wid=""
+  for i in $(seq 1 30); do
+    wid="$(xdotool search --class '^dictate-osd$' 2>/dev/null | head -1)"
+    [ -n "$wid" ] && break
+    sleep 0.01
+  done
+  [ -n "$wid" ] || return 0
+  for i in $(seq 1 "$OSD_SLIDE_STEPS"); do
+    frac="$(awk -v i="$i" -v n="$OSD_SLIDE_STEPS" 'BEGIN{t=i/n; print 1-(1-t)*(1-t)}')"
+    yy="$(awk -v y0="$y0" -v y1="$y" -v f="$frac" 'BEGIN{printf "%d", y0+(y1-y0)*f}')"
+    xdotool windowmove --sync "$wid" "$x" "$yy" 2>>"$LOG"
+    sleep "$OSD_SLIDE_STEP_DELAY"
+  done
+}
+
+osd_show() {
+  local text="$1" timeout_ms="$2" secs gen innerw innerh
+  secs="$(awk -v t="$timeout_ms" 'BEGIN{s=t/1000; if (s<0.3) s=0.3; printf "%.2f", s}')"
+  innerw=$((OSD_W - OSD_PAD * 2)); innerh=$((OSD_H - OSD_PAD * 2))
+  magick -size "${OSD_W}x${OSD_H}" xc:none -fill "$OSD_BG" \
+    -draw "roundrectangle 0,0,$((OSD_W - 1)),$((OSD_H - 1)),$OSD_RADIUS,$OSD_RADIUS" \
+    "$OSD_BG_PNG" 2>>"$LOG" || return 0
+  magick -background none -fill "$OSD_FG" -font "$OSD_FONT" -pointsize "$OSD_SIZE" \
+    -size "${innerw}x${innerh}" -gravity center caption:"$text" "$OSD_CAP" 2>>"$LOG" || return 0
+  magick "$OSD_BG_PNG" "$OSD_CAP" -gravity center -compose over -composite \
+    "$OSD_PNG_TMP" 2>>"$LOG" || return 0
+  mv -f "$OSD_PNG_TMP" "$OSD_PNG"
+  osd_ensure_window
+  gen="$(date +%s%N)"
+  echo "$gen" >"$OSD_GEN"
+  ( sleep "$secs"; [ "$(cat "$OSD_GEN" 2>/dev/null)" = "$gen" ] && osd_kill ) &
+}
+
+# The legacy image renderer is available for comparison with
+# DICTATE_OSD_BACKEND=feh. The default uses a separate 30fps GTK drawing loop.
+notify() {
+  local title="$1" body="${2:-}" timeout="${3:-2000}"
+  if [ "${DICTATE_OSD_BACKEND:-gtk}" = "feh" ]; then
+    [ -n "$body" ] && title="$title
+$body"
+    osd_show "$title" "$timeout"
+    return
+  fi
+  local phase=success label="Ready" text="$title" state_dir tmp helper
+  case "$title" in
+    '🎤 recording…') phase=recording; label="Listening"; text="" ;;
+    '🎤 '*) phase=recording; label="Listening"; text="${title#🎤 }" ;;
+    '⏳ '*) phase=processing; label="${title#⏳ }"; text="$body" ;;
+    dictate:*) phase=error; label="${title#dictate: }"; text="$body" ;;
+    '📋 '*) label="Copied to clipboard"; text="${title#📋 }" ;;
+  esac
+  if [ "$phase" = success ] && [ -n "$body" ]; then
+    text="$text
+$body"
+  fi
+  state_dir="$RUNDIR/dictate-overlay-$UID"
+  mkdir -p "$state_dir" || return 0
+  chmod 700 "$state_dir"
+  tmp="$(mktemp "$state_dir/state.XXXXXX")" || return 0
+  # Atomic messages, one expiry owned by the renderer, no sleeping timer jobs.
+  if jq -n --arg phase "$phase" --arg label "$label" --arg text "$text" \
+      --arg audio "$RAW" --argjson channels "$CHANNELS" --argjson channel "$CHAN" \
+      --argjson now "$(date +%s.%N)" --argjson ms "$timeout" \
+      '{phase:$phase,label:$label,text:$text,audio:$audio,channels:$channels,
+        channel:$channel,duration:($ms/1000),expires:($now+$ms/1000)}' >"$tmp"; then
+    mv -f "$tmp" "$state_dir/state.json"
+    helper="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/dictate-overlay"
+    nohup "$helper" </dev/null >>"$LOG" 2>&1 &
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# How the transcript reaches the focused window.
+#
+#   auto  (default) paste via the clipboard, typing only if the app is unknown
+#   paste           always paste
+#   type            always synthesise keystrokes
+#
+# Typing is universal but costs TYPE_DELAY *per character*: at 4ms a 200-char
+# dictation spends 800ms, four times the 0.2s transcription it waited on. The
+# delay cannot just be dropped to 0 — apps drain X events asynchronously and a
+# faster burst mangles the shift press/release pairs behind every capital.
+#
+# Pasting is one keystroke regardless of length, and in a terminal it is also
+# *safer*: ctrl+shift+v goes through bracketed paste, so nvim and readline treat
+# the text as a paste instead of as keystrokes. Typing into nvim in normal mode
+# executes the transcript as commands.
+INPUT_MODE="${DICTATE_INPUT:-auto}"
+TYPE_DELAY="${DICTATE_TYPE_DELAY:-4}"
+# Terminals paste with ctrl+shift+v; a plain ctrl+v there is a literal ^V.
+TERMINAL_CLASSES="${DICTATE_TERMINALS:-Alacritty|kitty|Ghostty|com.mitchellh.ghostty|URxvt|XTerm|st-256color|foot|WezTerm|Konsole|Gnome-terminal}"
+
+# Pasting needs the text ON the clipboard, so it necessarily clobbers whatever
+# was there. DICTATE_CLIPBOARD=restore puts the old contents back afterwards.
+#
+# Clipboard restoration runs in the background after the shortcut. Its delay
+# gives the application time to request the selection; it does not postpone
+# sending the shortcut. The 400 ms default preserves the approximate old
+# window (100 ms post-key wait + key release + 250 ms restore delay).
+# This is a heuristic, not an application acknowledgement.
+# Increase it or use keep mode if an app requests clipboard data unusually late.
+#
+# Clipboard history depends on the clipboard manager. This restore path keeps
+# plain text only; rich formats, images, and an empty prior selection are not
+# restored. Dictation history is a separate, configurable feature.
+CLIP_MODE="${DICTATE_CLIPBOARD:-restore}"
+PASTE_SETTLE="${DICTATE_PASTE_SETTLE:-0.4}"
+
+have_copyq() { command -v copyq >/dev/null 2>&1 && copyq size >/dev/null 2>&1; }
+
+# Prefer copyq when it is running: as the clipboard manager it already owns the
+# selection and serves it persistently, where xclip must fork and hold it.
+clip_get() {
+  if [ "${CLIP_BACKEND:-}" = copyq ] || { [ -z "${CLIP_BACKEND:-}" ] && have_copyq; }; then
+    copyq clipboard 2>/dev/null
+  else xclip -selection clipboard -o 2>/dev/null; fi
+}
+clip_set() {
+  if [ "${CLIP_BACKEND:-}" = copyq ] || { [ -z "${CLIP_BACKEND:-}" ] && have_copyq; }; then
+    copyq copy -- "$1" >/dev/null 2>&1
+  else printf '%s' "$1" | xclip -selection clipboard 2>/dev/null; fi
+}
+
+# --- live preview (prototype) -------------------------------------------------
+# Show the transcript-so-far while you are still holding the key.
+#
+# Whisper pads short clips to a fixed window, so re-transcribing the WHOLE
+# buffer each tick can be comparable to an incremental scheme while avoiding
+# Whisper's revision problem: each tick is a complete, self-consistent
+# transcript rather than an append that might contradict itself.
+#
+# The preview updates the click-through overlay; it must preserve input focus.
+STREAM="${DICTATE_STREAM:-1}"
+STREAM_INTERVAL="${DICTATE_STREAM_INTERVAL:-0}"
+STREAM_PAUSE="${DICTATE_STREAM_PAUSE:-0.005}"
+PREVIEW_PIDFILE="$RUNDIR/dictate-preview.pid"
+PREVIEW_TIMING="$DATADIR/dictate-preview-timing.tsv"
+
+preview_timing() {
+  # Metadata only; replaced each recording so the log stays bounded.
+  awk -v s="$1" -v p="$2" -v r="$3" -v f="$4" -v previous="$5" \
+      -v updated="$6" -v status="$7" 'BEGIN {
+    printf "%.6f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%d\t%s\n",
+      s, (p-s)*1000, (r-p)*1000, (f-r)*1000, (f-s)*1000,
+      (previous>0 ? (s-previous)*1000 : 0), updated, status
+  }' >>"$PREVIEW_TIMING" || true
+}
+
+preview_loop() {
+  # Bash's EPOCHREALTIME uses a comma under cs_CZ. Keep timestamps and awk
+  # arithmetic locale-independent while retaining UTF-8 text handling.
+  local LC_ALL=C.UTF-8
+  export LC_ALL
+  local snap="$DATADIR/dictate-preview.pcm" wav="$DATADIR/dictate-preview.wav"
+  local last="" txt delay tick_started="$EPOCHREALTIME"
+  local previous=0 prepared transcribed finished updated
+  local gate_enabled="${DICTATE_STREAM_GATE:-1}" gate_in gate_out gate_pid helper
+  if [ "$gate_enabled" = 1 ]; then
+    helper="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/dictate-overlay/preview_gate.py"
+    coproc PREVIEW_GATE { exec python3 "$helper" "$RAW" "$CHANNELS" "$CHAN" "$PIDFILE" "${DICTATE_STREAM_GATE_DB:--48}"; }
+    gate_pid="$PREVIEW_GATE_PID"
+    gate_out="${PREVIEW_GATE[0]}"; gate_in="${PREVIEW_GATE[1]}"
+    # preview_loop runs in its own background shell. Reap its helper on stop.
+    # shellcheck disable=SC2064 # Capture this helper PID before locals go out of scope.
+    trap "kill $gate_pid 2>/dev/null || true" EXIT
+    trap 'exit 0' TERM INT
+  fi
+  printf 'started_unix\tprep_ms\trequest_ms\tfinish_ms\twork_ms\tstart_gap_ms\tupdated\tstatus\n' >"$PREVIEW_TIMING" || true
+  # By default run back-to-back, with only a small pause after completed work.
+  # An optional start-to-start target includes conversion and inference time.
+  # Requests remain sequential even with a zero pause; there is no queue.
+  # Use elapsed time for the safety cap; iteration count no longer measures it.
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    delay="$STREAM_PAUSE"
+    if [ "$STREAM_INTERVAL" != 0 ]; then
+      delay=$(awk -v interval="$STREAM_INTERVAL" -v pause="$STREAM_PAUSE" \
+        -v start="$tick_started" -v now="$EPOCHREALTIME" \
+        'BEGIN { d=interval-(now-start); printf "%.4f", (d>pause ? d : pause) }')
+    fi
+    [ "$delay" = 0 ] || sleep "$delay"
+    [ -e "$PIDFILE" ] || break
+    if [ "$gate_enabled" = 1 ]; then
+      if ! printf 'next\n' >&"$gate_in" || ! read -r -u "$gate_out"; then
+        echo "note: preview gate exited; continuing without silence gating" >>"$LOG"
+        gate_enabled=0
+      fi
+    fi
+    [ -e "$PIDFILE" ] || break
+    tick_started="$EPOCHREALTIME"
+    [ -s "$RAW" ] || continue
+    # Copy first: the capture keeps appending, and ffmpeg reading a file that
+    # grows underneath it can decode a torn final frame.
+    if ! cp "$RAW" "$snap" 2>/dev/null || ! raw_to_mono16 "$snap" "$wav"; then
+      finished="$EPOCHREALTIME"
+      preview_timing "$tick_started" "$finished" "$finished" "$finished" "$previous" 0 prepare_error
+      previous="$tick_started"
+      continue
+    fi
+    prepared="$EPOCHREALTIME"
+    if ! txt="$(curl -sf --connect-timeout 1 --max-time 5 "$SERVER/inference" \
+             -F "file=@$wav" -F "response_format=json" \
+             --form-string "language=$LANG_" --form-string "prompt=$PROMPT" 2>/dev/null \
+           | jq -r '.text // empty' 2>/dev/null | tr -s ' \n' ' ')"; then
+      finished="$EPOCHREALTIME"
+      preview_timing "$tick_started" "$prepared" "$finished" "$finished" "$previous" 0 request_error
+      previous="$tick_started"
+      continue
+    fi
+    transcribed="$EPOCHREALTIME"
+    txt="${txt# }"; txt="${txt% }"
+    # Style the preview too, so what you see while speaking is what lands.
+    [ -n "$txt" ] && txt="$(restyle "$txt")"
+    updated=0
+    if [ -n "$txt" ] && [ "$txt" != "$last" ]; then
+      notify "🎤 $txt" "" "$((MAX_SECS * 1000))"
+      last="$txt"; updated=1
+    fi
+    preview_timing "$tick_started" "$prepared" "$transcribed" "$EPOCHREALTIME" "$previous" "$updated" ok
+    previous="$tick_started"
+  done
+}
+
+stop_preview() {
+  [ -e "$PREVIEW_PIDFILE" ] || return 0
+  kill "$(cat "$PREVIEW_PIDFILE")" 2>/dev/null || true
+  rm -f "$PREVIEW_PIDFILE"
+}
+
+# --- writing style -----------------------------------------------------------
+# Rewrite the transcript the way you actually write: no sentence-initial
+# capitals, "..." where a sentence would end in a period.
+#
+# Done as a deterministic post-transform rather than by conditioning whisper's
+# initial prompt, even though the prompt demonstrably does steer style. The
+# prompt also perturbs *word choice* — the glossary flipped "at a normal
+# distance" to "at the normal distance" in testing — and style is cosmetic, so
+# it should not be able to cost accuracy. This way recognition is untouched.
+#
+# Proper nouns survive: anything in PROMPT is left alone, as is "I"/"I'm", and
+# any word with internal capitals (SvelteKit, NixOS) or all caps.
+STYLE="${DICTATE_STYLE:-0}"
+
+restyle() {
+  [ "$STYLE" = "1" ] || { printf '%s' "$1"; return; }
+  printf '%s' "$1" | python3 -c '
+import re, sys
+KEEP = {w.strip().lower() for w in re.split(r"[,\s]+", sys.argv[1]) if w.strip()}
+text = " ".join(sys.stdin.read().split())
+
+def lower_initial(m):
+    lead, word = m.group(1), m.group(2)
+    if word.lower() in KEEP:                  return lead + word
+    if word == "I" or word.startswith("I%s" % chr(39)): return lead + word
+    if re.match(r"^[A-Z][a-z" + chr(39) + r"]*$", word): return lead + word[0].lower() + word[1:]
+    return lead + word
+text = re.sub(r"(^|[.!?]\s+)([A-Za-z][\w" + chr(39) + r"]*)", lower_initial, text)
+# Sentence-separating periods become " ... " — space on BOTH sides.
+# "itch.io" and "3.5" are safe: they have no whitespace after the period.
+text = re.sub(r"\.\s+", " ... ", text)
+# No trailing ellipsis: a final period is simply dropped. "?" and "!" stay.
+text = re.sub(r"\s*\.\s*$", "", text)
+sys.stdout.write(text.strip())
+' "$PROMPT"
+}
+
+type_text() { xdotool type --clearmodifiers --delay "$TYPE_DELAY" -- "$1"; }
+
+# One X client owns the entire chord, including clearing/restoring modifiers.
+# The old three-command sequence added two 100 ms waits and could preserve an
+# unwanted held modifier between commands. Keep xdotool's usual 12 ms spacing;
+# DICTATE_PASTE_KEY_DELAY=0 is supported for testing without event spacing.
+PASTE_KEY_DELAY="${DICTATE_PASTE_KEY_DELAY:-0.012}"
+send_paste_key() {
+  local delay_ms
+  delay_ms=$(LC_ALL=C awk -v seconds="${PASTE_KEY_DELAY/,/.}" 'BEGIN { printf "%d", seconds*1000 }')
+  xdotool key --clearmodifiers --delay "$delay_ms" "$1"
+  release_mark paste_shortcut_sent
+}
+
+deliver() {
+  local text="$1" cls key
+  release_mark delivery_started
+  if [ "$INPUT_MODE" = "type" ]; then type_text "$text"; return; fi
+
+  cls="$(xdotool getactivewindow getwindowclassname 2>/dev/null || true)"
+  if [ -z "$cls" ] || [ "$cls" = "(null)" ]; then
+    # Unknown app: typing always works, pasting might not. Only paste here if
+    # explicitly asked to.
+    if [ "$INPUT_MODE" = "paste" ]; then key="ctrl+v"; else type_text "$text"; return; fi
+  elif printf '%s' "$cls" | grep -qiE "^($TERMINAL_CLASSES)$"; then
+    key="ctrl+shift+v"
+  else
+    key="ctrl+v"
+  fi
+
+  local prev="" i CLIP_BACKEND
+  if have_copyq; then CLIP_BACKEND=copyq; else CLIP_BACKEND=xclip; fi
+  release_mark clipboard_backend_selected
+  [ "$CLIP_MODE" = "restore" ] && prev="$(clip_get)"
+  release_mark clipboard_saved
+  clip_set "$text"
+  release_mark clipboard_set
+
+  # The setter forks to hold the selection; pasting before it owns the clipboard
+  # would paste whatever was there before. Wait for ownership, don't guess.
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(clip_get)" = "$text" ] && break
+    sleep 0.02
+    if [ "$i" = 10 ]; then
+      echo "note: clipboard not ready, typing instead" >>"$LOG"
+      type_text "$text"; return
+    fi
+  done
+
+  release_mark clipboard_verified
+  send_paste_key "$key"
+
+  if [ "$CLIP_MODE" = "restore" ] && [ -n "$prev" ]; then
+    # A user/application may copy something new while this timer is running.
+    # Restore only while the clipboard still contains our dictation text.
+    ( sleep "$PASTE_SETTLE"; [ "$(clip_get)" != "$text" ] || clip_set "$prev" ) &
+  fi
+}
+
+# Capture prefers PipeWire's native recorder when available. ffmpeg's PulseAudio
+# input can mishandle multichannel sources on some systems, and often defaults
+# to two channels regardless of what the source offers. Set -channels explicitly
+# and use `dictate scan` when a higher input is not visible.
+have_pw() { [ "${DICTATE_PW:-1}" != "0" ] && command -v pw-record >/dev/null 2>&1; }
+
+# Start an unbounded capture of $1 in the background; prints the pid.
+#
+# Headerless raw, not WAV: a WAV being written still has an unfinished length
+# field, so a *prefix* of it is not reliably decodable. Streaming needs to read
+# the partial capture while it grows, and raw PCM has no header to be wrong —
+# any prefix decodes with the format supplied explicitly (see raw_args).
+# Hard ceiling on a single capture. Nothing you dictate runs five minutes, and
+# without this a lost key-release means an unbounded recorder. `timeout -s INT`
+# rather than the default SIGTERM: both backends only finalise a clean stream on
+# SIGINT, and timeout forwards a signal it receives to the child, so stop()'s own
+# `kill -INT` still reaches the recorder through it.
+MAX_SECS="${DICTATE_MAX_SECS:-300}"
+
+cap_bg() {
+  if have_pw; then
+    timeout -s INT "$MAX_SECS" \
+      pw-record --target "$MIC" --rate 48000 --channels "$CHANNELS" \
+      --format s16 --container raw "$1" >>"$LOG" 2>&1 &
+  else
+    timeout -s INT "$MAX_SECS" \
+      ffmpeg -nostdin -hide_banner -y -f pulse -channels "$CHANNELS" -i "$PULSE_MIC" \
+      -ar 48000 -f s16le "$1" >>"$LOG" 2>&1 &
+  fi
+  echo $!
+}
+
+# Kill any recorder that outlived its pidfile.
+#
+# The binding is a press/release pair (sxhkd: F19 -> start, @F19 -> stop). Lose
+# the release — sxhkd restart, an X grab, a keyd reload — and stop() never runs.
+# The old stop() then returned silently on the missing pidfile and nothing in the
+# script ever looked for the process again, so it recorded until the disk said
+# no. Match on the capture filename, which is in the command line of pw-record,
+# ffmpeg and timeout alike, and is specific enough not to hit anything else.
+reap_recorders() {
+  local pat="dictate-raw\.pcm"
+  pgrep -u "$UID" -f "$pat" >/dev/null 2>&1 || return 0
+  pkill -INT -u "$UID" -f "$pat" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    pgrep -u "$UID" -f "$pat" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  pkill -KILL -u "$UID" -f "$pat" 2>/dev/null || true
+}
+
+# The format of what cap_bg writes; raw PCM carries none of it itself.
+raw_args() { printf '%s\n' -f s16le -ar 48000 -ac "$CHANNELS"; }
+
+# Extract our channel from a headerless multichannel capture at whisper's 16k mono.
+raw_to_mono16() {
+  local a; mapfile -t a < <(raw_args)
+  ffmpeg -nostdin -hide_banner -loglevel error "${a[@]}" -i "$1" \
+    -af "pan=mono|c0=c$CHAN" -ar 16000 -ac 1 -c:a pcm_s16le -y "$2" 2>>"$LOG"
+}
+
+# Blocking capture of $2 seconds into $1. -s INT because pw-record only
+# finalises the WAV header on SIGINT; SIGTERM leaves it unreadable.
+cap_secs() {
+  if have_pw; then
+    timeout -s INT "$2" pw-record --target "$MIC" --rate 48000 \
+      --channels "$CHANNELS" --format s16 "$1" >>"$LOG" 2>&1 || true
+  else
+    ffmpeg -nostdin -hide_banner -loglevel error -f pulse -channels "$CHANNELS" \
+      -i "$PULSE_MIC" -t "$2" -c:a pcm_s16le -y "$1" 2>>"$LOG"
+  fi
+}
+
+# Pull our one channel out of a multichannel capture, at whisper's 16k mono.
+to_mono16() {
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$1" \
+    -af "pan=mono|c0=c$CHAN" -ar 16000 -ac 1 -c:a pcm_s16le -y "$2" 2>>"$LOG"
+}
+
+# Liveness only: any HTTP response means it is listening. No -f — a bare GET on
+# /inference legitimately 4xxs, and -f would report a healthy server as down.
+server_up() { [ -n "$SERVER" ] && curl -s --max-time 1 -o /dev/null "$SERVER/" 2>/dev/null; }
+
+# Transcribe $1 with parakeet. One-shot only — there is no parakeet-server, so
+# it always pays model load and cannot match whisper-server's resident latency.
+transcribe_parakeet() {
+  parakeet-cli -m "$PARAKEET_MODEL" -f "$1" -np -t "$THREADS" 2>>"$LOG"
+}
+
+# Transcribe $1 with whisper. Prefers the resident server; falls back to
+# whisper-cli so a stopped server degrades to "slower", never "broken".
+transcribe_whisper() {
+  local wav="$1" out text
+  if [ -n "$SERVER" ]; then
+    # --connect-timeout 2 so a *hung* server costs 2s, not the 120s transfer
+    # budget; refused connections fail instantly anyway. jq -e (not '.text //
+    # empty') so a response without a .text field — an error payload, say —
+    # exits non-zero and falls through, instead of silently yielding "".
+    if out="$(curl -sf --connect-timeout 2 --max-time 120 "$SERVER/inference" \
+                -F "file=@$wav" -F "response_format=json" \
+                --form-string "language=$LANG_" --form-string "prompt=$PROMPT" \
+                -F "temperature=0.0" 2>>"$LOG")" \
+       && text="$(printf '%s' "$out" | jq -er '.text' 2>/dev/null)"; then
+      printf '%s' "$text"
+      return 0
+    fi
+    echo "note: server unreachable or bad response, using whisper-cli" >>"$LOG"
+  fi
+  whisper-cli -m "$MODEL" -f "$wav" -l "$LANG_" -nt -np -sns \
+    "${vad[@]}" -t "$THREADS" --prompt "$PROMPT" 2>>"$LOG"
+}
+
+transcribe() {
+  case "$ENGINE" in
+    parakeet) transcribe_parakeet "$1" ;;
+    *)        transcribe_whisper  "$1" ;;
+  esac
+}
+
+# --- recoverable history ----------------------------------------------------
+# One directory per utterance keeps audio, text and status together. The audio
+# is copied before transcription or delivery, and the transcript is written
+# before xdotool is touched, so either half remains useful if a later step dies.
+HISTORY_ENTRY=""
+
+history_prune() {
+  [ "$HISTORY_READY" = "1" ] || return 0
+  local -a entries
+  local i
+
+  if printf '%s' "$HISTORY_DAYS" | grep -qxE '[0-9]+' && [ "$HISTORY_DAYS" -gt 0 ]; then
+    find "$HISTORY_DIR" -mindepth 1 -maxdepth 1 -type d \
+      -name '20??-??-??_??-??-??-*' -mtime "+$HISTORY_DAYS" -exec rm -rf -- {} +
+  fi
+
+  if printf '%s' "$HISTORY_MAX" | grep -qxE '[0-9]+' && [ "$HISTORY_MAX" -gt 0 ]; then
+    mapfile -t entries < <(find "$HISTORY_DIR" -mindepth 1 -maxdepth 1 -type d \
+      -name '20??-??-??_??-??-??-*' -print | sort -r)
+    for ((i=HISTORY_MAX; i<${#entries[@]}; i++)); do
+      rm -rf -- "${entries[$i]}"
+    done
+  fi
+}
+
+history_archive_audio() {
+  local audio="$1" status="$2" id tmp started saved dur
+  HISTORY_ENTRY=""
+  [ "$HISTORY_READY" = "1" ] || return 0
+  [ -s "$audio" ] || return 0
+
+  id="$(date '+%Y-%m-%d_%H-%M-%S')-$$"
+  tmp="$HISTORY_DIR/.${id}.tmp"
+  HISTORY_ENTRY="$HISTORY_DIR/$id"
+  started="$(cat "$STARTFILE" 2>/dev/null || date --iso-8601=seconds)"
+  saved="$(date --iso-8601=seconds)"
+  dur="$(ffprobe -v quiet -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$audio" 2>/dev/null || true)"
+
+  if ! mkdir -p "$tmp" || ! cp -- "$audio" "$tmp/audio.wav"; then
+    echo "warning: could not archive dictation audio in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  printf '%s\n' "$status" >"$tmp/status" || {
+    echo "warning: could not write dictation history status in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  }
+  if ! {
+    printf 'id=%s\n' "$id"
+    printf 'started=%s\n' "$started"
+    printf 'saved=%s\n' "$saved"
+    printf 'duration_seconds=%s\n' "${dur:-unknown}"
+    printf 'engine=%s\n' "$ENGINE"
+    printf 'mic=%s\n' "$MIC"
+    printf 'channel=%s/%s\n' "$CHAN" "$CHANNELS"
+    printf 'mode=%s\n' "$(cat "$MODEFILE" 2>/dev/null || echo fast)"
+  } >"$tmp/details"; then
+    echo "warning: could not write dictation history details in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  if ! mv -- "$tmp" "$HISTORY_ENTRY"; then
+    echo "warning: could not publish dictation history entry $HISTORY_ENTRY" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  history_prune || echo "warning: could not prune dictation history" >>"$LOG"
+}
+
+history_archive_raw_failure() {
+  local status="$1" id tmp started
+  HISTORY_ENTRY=""
+  [ "$HISTORY_READY" = "1" ] || return 0
+  [ -s "$RAW" ] || return 0
+
+  id="$(date '+%Y-%m-%d_%H-%M-%S')-$$"
+  tmp="$HISTORY_DIR/.${id}.tmp"
+  HISTORY_ENTRY="$HISTORY_DIR/$id"
+  started="$(cat "$STARTFILE" 2>/dev/null || date --iso-8601=seconds)"
+  if ! mkdir -p "$tmp" || ! cp -- "$RAW" "$tmp/audio.raw.pcm"; then
+    echo "warning: could not archive failed raw capture in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  printf '%s\n' "$status" >"$tmp/status" || {
+    echo "warning: could not write dictation history status in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  }
+  if ! {
+    printf 'id=%s\n' "$id"
+    printf 'started=%s\n' "$started"
+    printf 'saved=%s\n' "$(date --iso-8601=seconds)"
+    printf 'raw_format=s16le,48000Hz,%sch\n' "$CHANNELS"
+    printf 'mic=%s\n' "$MIC"
+    printf 'channel=%s/%s\n' "$CHAN" "$CHANNELS"
+  } >"$tmp/details"; then
+    echo "warning: could not write raw-capture history details in $tmp" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  if ! mv -- "$tmp" "$HISTORY_ENTRY"; then
+    echo "warning: could not publish raw-capture history entry $HISTORY_ENTRY" >>"$LOG"
+    HISTORY_ENTRY=""
+    return 0
+  fi
+  history_prune || echo "warning: could not prune dictation history" >>"$LOG"
+}
+
+history_status() {
+  [ -n "$HISTORY_ENTRY" ] || return 0
+  printf '%s\n' "$1" >"$HISTORY_ENTRY/status" || {
+    echo "warning: could not update history status in $HISTORY_ENTRY" >>"$LOG"
+    return 0
+  }
+}
+
+history_text() {
+  [ -n "$HISTORY_ENTRY" ] || return 0
+  printf '%s\n' "$1" >"$HISTORY_ENTRY/${2:-transcript.txt}" || {
+    echo "warning: could not save transcript in $HISTORY_ENTRY" >>"$LOG"
+    return 0
+  }
+}
+
+history_entries() {
+  [ -d "$HISTORY_DIR" ] || return 0
+  find "$HISTORY_DIR" -mindepth 1 -maxdepth 1 -type d \
+    -name '20??-??-??_??-??-??-*' -print | sort -r
+}
+
+history_resolve() {
+  local wanted="${1:-latest}" path
+  local -a entries matches
+  if [ "$wanted" = "latest" ]; then
+    mapfile -t entries < <(history_entries)
+    [ "${#entries[@]}" -gt 0 ] && printf '%s\n' "${entries[0]}"
+    return
+  fi
+  printf '%s' "$wanted" | grep -qxE '[A-Za-z0-9_.-]+' || return 1
+  if [ -d "$HISTORY_DIR/$wanted" ]; then
+    printf '%s\n' "$HISTORY_DIR/$wanted"
+    return
+  fi
+  matches=()
+  while IFS= read -r path; do
+    [[ "$path" == "$HISTORY_DIR/$wanted"* ]] && matches+=("$path")
+  done < <(history_entries)
+  [ "${#matches[@]}" -eq 1 ] || return 1
+  printf '%s\n' "${matches[0]}"
+}
+
+history_list() {
+  local limit="${1:-20}" entry id status dur text n=0
+  printf '%s' "$limit" | grep -qxE '[0-9]+' || limit=20
+  while IFS= read -r entry && [ "$n" -lt "$limit" ]; do
+    id="${entry##*/}"
+    status="$(cat "$entry/status" 2>/dev/null || echo unknown)"
+    dur="$(sed -n 's/^duration_seconds=//p' "$entry/details" 2>/dev/null)"
+    if [ -r "$entry/transcript.txt" ]; then
+      text="$(tr '\n\t' '  ' <"$entry/transcript.txt")"
+    elif [ -r "$entry/transcript.raw.txt" ]; then
+      text="$(tr '\n\t' '  ' <"$entry/transcript.raw.txt")"
+    else
+      text=""
+    fi
+    [ "${#text}" -gt 72 ] && text="${text:0:69}..."
+    printf '%-27s  %-18s  %6ss  %s\n' "$id" "$status" "${dur%.*}" "$text"
+    n=$((n + 1))
+  done < <(history_entries)
+}
+
+history_show() {
+  local entry
+  entry="$(history_resolve "${1:-latest}")" || {
+    echo "dictate: history entry not found or prefix is ambiguous: ${1:-latest}" >&2
+    return 1
+  }
+  [ -n "$entry" ] || { echo "dictate: history is empty" >&2; return 1; }
+  cat "$entry/details"
+  printf 'status=%s\n' "$(cat "$entry/status" 2>/dev/null || echo unknown)"
+  if [ -r "$entry/audio.wav" ]; then printf 'audio=%s\n' "$entry/audio.wav"; fi
+  if [ -r "$entry/audio.raw.pcm" ]; then printf 'raw_audio=%s\n' "$entry/audio.raw.pcm"; fi
+  if [ -r "$entry/transcript.txt" ]; then
+    printf '\ntranscript:\n'
+    cat "$entry/transcript.txt"
+  fi
+  if [ -r "$entry/transcript.raw.txt" ] \
+     && { [ ! -r "$entry/transcript.txt" ] \
+          || ! cmp -s "$entry/transcript.raw.txt" "$entry/transcript.txt"; }; then
+    printf '\nraw_transcript:\n'
+    cat "$entry/transcript.raw.txt"
+  fi
+}
+
+history_retry() {
+  local entry text
+  if [ -n "${1:-}" ]; then
+    entry="$(history_resolve "$1")" || true
+  else
+    entry="$(history_entries | while IFS= read -r e; do
+      [ -s "$e/transcript.txt" ] && { printf '%s\n' "$e"; break; }
+    done)"
+  fi
+  [ -n "$entry" ] && [ -s "$entry/transcript.txt" ] || {
+    echo "dictate: no saved transcript found; use 'dictate history' and 'dictate show ID'" >&2
+    return 1
+  }
+  text="$(cat "$entry/transcript.txt")"
+  if [ "${DICTATE_NOTYPE:-0}" = "1" ]; then
+    clip_set "$text"
+    notify "📋 recovered dictation" "$text" "$OSD_DONE_MS"
+  else
+    deliver "$text"
+  fi
+  printf 'retried %s\n' "${entry##*/}"
+}
+
+# A killed stop process can leave a complete raw capture behind. Salvage it on
+# the next start instead of unlinking the only copy. It remains untranscribed,
+# but `dictate show ID` points to playable audio for manual recovery/debugging.
+history_recover_abandoned() {
+  local recovered="$DATADIR/dictate-recovered-$$.wav" fallback converted=0
+  [ -s "$RAW" ] || return 0
+  if raw_to_mono16 "$RAW" "$recovered" && [ -s "$recovered" ]; then
+    converted=1
+    history_archive_audio "$recovered" "recovered-after-crash"
+  else
+    history_archive_raw_failure "raw-recovered-after-crash"
+  fi
+  # With history explicitly disabled, deletion is intentional. If history was
+  # enabled but archival failed, move a recovery file aside before a new capture
+  # gets the scratch filename. A same-filesystem rename also works on a full disk.
+  if [ "$HISTORY_ENABLED" = "1" ] && [ -z "$HISTORY_ENTRY" ]; then
+    fallback="$DATADIR/dictate-recovered-$(date '+%Y-%m-%d_%H-%M-%S')-$$"
+    if [ "$converted" = "1" ]; then
+      mv -- "$recovered" "$fallback.wav" || return 1
+      rm -f -- "$RAW" "$STARTFILE"
+      echo "warning: history unavailable; recovered audio kept at $fallback.wav" >>"$LOG"
+    else
+      mv -- "$RAW" "$fallback.raw.pcm" || return 1
+      rm -f -- "$STARTFILE"
+      echo "warning: history unavailable; recovered raw audio kept at $fallback.raw.pcm" >>"$LOG"
+    fi
+    return 0
+  fi
+  rm -f -- "$recovered" "$RAW" "$STARTFILE"
+}
+
+# History commands do not touch the microphone or require a running model.
+case "${1:-}" in
+  history) history_list "${2:-20}"; exit 0 ;;
+  show)    history_show "${2:-latest}"; exit $? ;;
+  retry)   history_retry "${2:-}"; exit $? ;;
+esac
+
+# ------------------------------------------------------------------ scan
+# Find which input of a multichannel interface your mic is on. Records the whole
+# source and reports every channel separately, so a mic on input 6 of 10 shows
+# up instead of being silently truncated away.
+if [ "${1:-}" = "scan" ]; then
+  secs="${2:-6}"
+  nch="$(pactl list sources 2>/dev/null \
+         | awk -v m="$MIC" '$1=="Name:" {cur=($2==m)} cur && /Sample Specification:/ {print $0; exit}' \
+         | grep -oE '[0-9]+ch' | tr -d 'ch')"
+  nch="${nch:-$CHANNELS}"
+  echo "Source : $MIC"
+  echo "Channels: $nch"
+  echo
+  echo "SPEAK NORMALLY for ${secs}s — talk continuously so quiet channels stand out."
+  tmp="$DATADIR/dictate-scan.wav"
+  CHANNELS="$nch"   # scan exits below, so this cannot leak into other paths
+  cap_secs "$tmp" "$secs"
+  echo
+  for c in $(seq 0 $((nch - 1))); do
+    # astats, not volumedetect: volumedetect clamps at the 16-bit floor, so every
+    # quiet channel reports an identical -90.3 dBFS (1 LSB of 16-bit) and a mic
+    # at low gain is indistinguishable from an unconnected input.
+    read -r pk rm < <(ffmpeg -hide_banner -i "$tmp" -af "pan=mono|c0=c$c,astats=metadata=1" -f null - 2>&1 \
+      | awk '/^\[Parsed_astats/ && /Peak level dB/{p=$NF} /^\[Parsed_astats/ && /RMS level dB/{m=$NF} END{print (p==""?"-inf":p), (m==""?"-inf":m)}')
+    note=""
+    awk -v p="$pk" 'BEGIN{exit !(p+0 <= -85)}' && note="  (nothing — dead input or gain at zero)"
+    awk -v p="$pk" 'BEGIN{exit !(p+0 > -85 && p+0 < -30)}' && note="  (live preamp, no speech)"
+    awk -v p="$pk" 'BEGIN{exit !(p+0 >= -30)}' && note="  <-- SIGNAL, use this one"
+    [ "$pk" = "-inf" ] && note="  (digital zero — channel not active)"
+    printf "  ch%-2s peak %8s  rms %8s%s\n" "$c" "$pk" "$rm" "$note"
+  done
+  echo
+  echo "  Use the loudest channel with:  DICTATE_CHANNELS=$nch DICTATE_CHAN=<n> dictate level"
+  echo "  Then set CHANNELS/CHAN at the top of this script."
+  echo "  kept at $tmp"
+  exit 0
+fi
+
+# ------------------------------------------------------------------ bench
+# Run both engines over the same audio so the choice is made on your voice and
+# your mic, not on someone's leaderboard.
+if [ "${1:-}" = "bench" ]; then
+  wav="${2:-$WAV}"
+  [ -r "$wav" ] || { echo "no audio at $wav — run 'dictate level' first, or pass a wav" >&2; exit 1; }
+  echo "audio: $wav"
+  ffmpeg -hide_banner -i "$wav" -af volumedetect -f null - 2>&1 \
+    | awk '/max_volume|mean_volume/{printf "  %s %s\n", $(NF-2), $(NF-1)}'
+  echo
+  # Every whisper model present, then parakeet. Each is warmed first: a cold
+  # process pays Vulkan shader compilation, which would swamp the timing.
+  for f in "$(dirname "$MODEL")"/ggml-*.bin; do
+    [ -r "$f" ] || continue
+    case "$f" in *silero*|*parakeet*) continue ;; esac
+    name="$(basename "$f" .bin)"; name="${name#ggml-}"
+    whisper-cli -m "$f" -f "$wav" -l "$LANG_" -nt -np -sns >/dev/null 2>&1 || continue
+    s=$(date +%s.%N)
+    out="$(whisper-cli -m "$f" -f "$wav" -l "$LANG_" -nt -np -sns \
+             --prompt "$PROMPT" 2>/dev/null | tr -s ' \n' ' ')"
+    e=$(date +%s.%N)
+    printf "  %-20s %5.2fs  %s\n" "$name" "$(awk -v a="$s" -v b="$e" 'BEGIN{print b-a}')" "$out"
+  done
+  if [ -r "$PARAKEET_MODEL" ]; then
+    parakeet-cli -m "$PARAKEET_MODEL" -f "$wav" -np >/dev/null 2>&1 || true
+    s=$(date +%s.%N)
+    out="$(transcribe_parakeet "$wav" | tr -s ' \n' ' ')"
+    e=$(date +%s.%N)
+    printf "  %-20s %5.2fs  %s\n" "parakeet-tdt-v3" "$(awk -v a="$s" -v b="$e" 'BEGIN{print b-a}')" "$out"
+  fi
+  echo
+  echo "  Note: these run through whisper-cli, but dictation runs through"
+  echo "  whisper-cli and whisper-server can differ on the same audio."
+  echo "  Use this command to shortlist models, then confirm the winner"
+  echo "  through the same server path used by dictation. Short generic"
+  echo "  sentences are not enough for a meaningful comparison."
+  exit 0
+fi
+
+# ------------------------------------------------------------------ serve
+# Run the resident model server in the foreground (for a systemd user unit).
+# Warms itself on startup so model and graphics initialization do not land on
+# the first dictation.
+if [ "${1:-}" = "serve" ]; then
+  port="${SERVER##*:}"
+  warm="$DATADIR/dictate-warm.wav"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i anullsrc=r=16000:cl=mono \
+    -t 1 -c:a pcm_s16le -y "$warm" 2>/dev/null || true
+  (
+    for _ in $(seq 1 240); do
+      curl -sf --max-time 2 -o /dev/null "$SERVER/inference" \
+        -F "file=@$warm" -F "response_format=json" \
+        --form-string "language=$LANG_" --form-string "prompt=$PROMPT" 2>/dev/null && break
+      sleep 0.5
+    done
+    echo "server warm" >&2
+  ) &
+  exec whisper-server -m "$MODEL" --host 127.0.0.1 --port "$port" \
+    -t "$THREADS" -nt -sns -l "$LANG_" --prompt "$PROMPT"
+fi
+
+# ------------------------------------------------------------------ level
+# Record a few seconds and report peak/RMS in dBFS, with a verdict. Targets are
+# the usual speech-capture guidance: leave headroom below 0 dBFS, keep speech
+# comfortably above the noise floor, and tune the result for the microphone.
+if [ "${1:-}" = "level" ]; then
+  secs="${2:-5}"
+  tmp="$DATADIR/dictate-level.wav"
+  echo "Recording ${secs}s from:"
+  echo "  $MIC"
+  echo "  channel $CHAN of $CHANNELS"
+  echo "Speak normally, at your usual distance and volume…"
+  raw="$DATADIR/dictate-level-raw.wav"
+  cap_secs "$raw" "$secs"
+  to_mono16 "$raw" "$tmp"
+
+  # astats, not volumedetect: the latter clamps at the 16-bit floor (-90.3 dBFS)
+  # so anything quieter is indistinguishable from anything else quieter.
+  read -r peak rms < <(ffmpeg -hide_banner -i "$tmp" -af astats=metadata=1 -f null - 2>&1 \
+    | awk '/Peak level dB/{p=$NF} /RMS level dB/{m=$NF} END{printf "%.1f %.1f\n", p, m}')
+
+  printf '\n  peak %8s dBFS\n  rms  %8s dBFS\n\n' "$peak" "$rms"
+
+  awk -v p="$peak" -v r="$rms" '
+    BEGIN {
+      if (p >= -1)       print "  CLIPPING — the signal is hitting full scale and distorting.\n" \
+                               "  Lower the input gain."
+      else if (p >= -12) print "  GOOD — healthy level with headroom. Nothing to fix."
+      else if (p >= -24) print "  QUIET but possibly usable. Consider moving closer or adjusting gain."
+      else if (p >= -36) print "  LOW — transcription may drop words. Move closer, adjust gain,\n" \
+                               "  or try DICTATE_VAD_THRESHOLD=0.35."
+      else               print "  TOO QUIET — below about -36 dBFS peak there is not enough\n" \
+                               "  signal above the noise floor. Move closer, or use a mic with\n" \
+                               "  a real preamp."
+      if (r < -50) print "\n  (RMS below -50 suggests almost nothing was captured — check the\n   mic is the right device and not physically muted.)"
+    }'
+
+  # Only meaningful when a filter chain is configured; with FILTER empty this
+  # would build "-af ,volumedetect", which ffmpeg rejects, printing nothing.
+  if [ -n "$FILTER" ]; then
+    echo
+    echo "  after the '$FILTER' chain it would measure:"
+    ffmpeg -hide_banner -i "$tmp" -af "$FILTER,volumedetect" -f null - 2>&1 \
+      | awk '/max_volume/{printf "    peak %8s dBFS\n", $(NF-1)} /mean_volume/{printf "    rms  %8s dBFS\n", $(NF-1)}'
+  fi
+  echo
+  echo "  kept at $tmp — play it back with: mpv $tmp"
+  exit 0
+fi
+
+# ------------------------------------------------------------------ meter
+# Live bar meter. Ctrl-C to stop.
+#
+# Reads raw PCM rather than ffmpeg's astats/ametadata, which looks like the
+# obvious tool but cannot stream: ametadata's file=- goes through AVIO's own
+# 4KB buffer, so at ~45 bytes per line nothing appears for ~9s and a Ctrl-C
+# before that prints nothing at all. stdbuf can't reach an AVIO buffer either
+  # Raw PCM plus an explicit flush per chunk gives responsive updates.
+if [ "${1:-}" = "meter" ]; then
+  echo "Live level from $MIC (channel $CHAN of $CHANNELS) — Ctrl-C to stop"
+  echo "  -60       -48       -36       -24       -12        0"
+  # --container raw, NOT the default wav: a wav header carries an unknown
+  # length when written to a pipe, and some readers refuse to stream it. Raw
+  # interleaved s16 is unambiguous, and Python de-interleaves it directly — no
+  # ffmpeg in the loop at all.
+  { if have_pw; then
+      pw-record --target "$MIC" --rate 48000 --channels "$CHANNELS" \
+        --format s16 --container raw - 2>/dev/null
+    else
+      ffmpeg -nostdin -hide_banner -loglevel error -f pulse -channels "$CHANNELS" \
+        -i "$PULSE_MIC" -ar 48000 -f s16le - 2>/dev/null
+    fi
+  } | python3 -c '
+import sys, math, array, signal
+signal.signal(signal.SIGINT, lambda *_: (sys.stdout.write("\n"), sys.exit(0)))
+SR, CHUNK = 48000, 0.1
+NCH, CH = int(sys.argv[1]), int(sys.argv[2])
+N = int(SR * CHUNK)
+peak_hold, hold = -99.0, 0
+while True:
+    try:
+        b = sys.stdin.buffer.read(N * NCH * 2)
+    except KeyboardInterrupt:
+        break
+    if len(b) < N * NCH * 2:
+        break
+    inter = array.array("h"); inter.frombytes(b)
+    a = inter[CH::NCH]
+    pk = max(abs(x) for x in a) or 1
+    rms = math.sqrt(sum(x * x for x in a) / len(a)) or 1e-9
+    db  = 20 * math.log10(rms / 32768)
+    dbp = 20 * math.log10(pk / 32768)
+    hold -= 1
+    if dbp > peak_hold or hold <= 0:
+        peak_hold, hold = dbp, 20          # ~2s decay
+    d = max(-60.0, min(0.0, db))
+    n = int((d + 60) / 60 * 50)
+    mark = "CLIP" if dbp > -1 else "hot" if dbp > -12 else "ok" if dbp > -30 else "quiet"
+    try:
+        sys.stdout.write("\r%-50s %6.1f dB  peak %6.1f  %-5s" %
+                         ("#" * n, db, peak_hold, mark))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        break
+' "$CHANNELS" "$CHAN" || true
+  echo
+  exit 0
+fi
+
+# ------------------------------------------------------------------ doctor
+if [ "${1:-}" = "doctor" ]; then
+  rc=0
+  for b in ffmpeg ffprobe xdotool pactl jq curl python3 timeout flock pgrep pkill awk sha256sum; do
+    if command -v "$b" >/dev/null; then
+      printf '  ok    %s\n' "$b"
+    else
+      printf '  MISS  %s\n' "$b"; rc=1
+    fi
+  done
+
+  if command -v pw-record >/dev/null; then
+    printf '  ok    pw-record (PipeWire capture)\n'
+  else
+    printf '  warn  pw-record missing — ffmpeg PulseAudio capture will be used\n'
+  fi
+
+  if command -v dunstify >/dev/null || command -v notify-send >/dev/null; then
+    printf '  ok    desktop notifications (failure fallback)\n'
+  else
+    printf '  warn  no desktop notification command — overlay failures only reach the log\n'
+  fi
+
+  if [ "${DICTATE_OSD_BACKEND:-gtk}" = gtk ]; then
+    if command -v nix-build >/dev/null; then
+      printf '  ok    nix-build (GTK overlay runtime)\n'
+    else
+      printf '  MISS  nix-build (GTK overlay runtime)\n'; rc=1
+    fi
+  else
+    for b in feh magick; do
+      if command -v "$b" >/dev/null; then
+        printf '  ok    %s (legacy overlay)\n' "$b"
+      else
+        printf '  MISS  %s (legacy overlay)\n' "$b"; rc=1
+      fi
+    done
+  fi
+
+  if [ "$ENGINE" = parakeet ]; then
+    if command -v parakeet-cli >/dev/null; then
+      printf '  ok    parakeet-cli (selected engine)\n'
+    else
+      printf '  MISS  parakeet-cli (selected engine)\n'; rc=1
+    fi
+    doctor_model="$PARAKEET_MODEL"
+  else
+    if command -v whisper-cli >/dev/null; then
+      printf '  ok    whisper-cli (selected engine)\n'
+    else
+      printf '  MISS  whisper-cli (selected engine)\n'; rc=1
+    fi
+    doctor_model="$MODEL"
+  fi
+
+  if [ -r "$doctor_model" ]; then
+    printf '  ok    model %s (%s)\n' "$doctor_model" "$(du -h "$doctor_model" | cut -f1)"
+  else
+    printf '  MISS  model %s\n' "$doctor_model"
+    if [ "$ENGINE" = parakeet ]; then
+      printf '        install the selected Parakeet model and set DICTATE_PARAKEET_MODEL\n'
+    else
+      printf '        install whisper.cpp and download a compatible ggml model\n'
+      printf '        see the project README for setup instructions\n'
+    fi
+    rc=1
+  fi
+
+  if [ "$USE_VAD" = "1" ]; then
+    if [ -r "$VAD_MODEL" ]; then printf '  ok    vad   enabled, %s\n' "$VAD_MODEL"
+    else printf '  MISS  vad   enabled but model missing: %s\n' "$VAD_MODEL"; rc=1; fi
+  else
+    printf '  ok    vad   disabled (enable with DICTATE_VAD=1 if needed)\n'
+  fi
+
+  if [ "$ENGINE" = parakeet ]; then
+    printf '  ok    server not used by parakeet engine\n'
+  elif server_up; then
+    printf '  ok    server %s (resident)\n' "$SERVER"
+  else
+    printf '  warn  server %s unreachable — falling back to whisper-cli\n' "$SERVER"
+    printf '        start it with: dictate serve\n'
+  fi
+
+  # A green doctor must mean "this is likely to work", not merely "the
+  # binaries exist", so also check writable storage and abandoned recorders.
+  avail_kb="$(df -Pk "$DATADIR" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -gt 1048576 ]; then
+    printf '  ok    space %s free on %s\n' \
+      "$(df -Ph "$DATADIR" | awk 'NR==2{print $4}')" "$DATADIR"
+  else
+    printf '  MISS  space %s is nearly full (%s free) — captures will truncate\n' \
+      "$DATADIR" "$(df -Ph "$DATADIR" 2>/dev/null | awk 'NR==2{print $4}')"; rc=1
+  fi
+
+  if [ "$HISTORY_READY" = "1" ]; then
+    printf '  ok    history %s (%s; %s days / %s entries max)\n' \
+      "$HISTORY_DIR" "$(du -sh "$HISTORY_DIR" 2>/dev/null | cut -f1)" \
+      "$HISTORY_DAYS" "$HISTORY_MAX"
+  elif [ "$HISTORY_ENABLED" = "1" ]; then
+    printf '  MISS  history enabled but unavailable at %s\n' "$HISTORY_DIR"; rc=1
+  else
+    printf '  warn  history disabled — failed pastes and audio will not be retained\n'
+  fi
+
+  if strays="$(pgrep -u "$UID" -f 'dictate-raw\.pcm' 2>/dev/null)"; then
+    printf '  MISS  stray recorder(s) still running: %s\n' "$(echo "$strays" | tr '\n' ' ')"
+    printf '        they hold disk even after deletion — fix: dictate stop\n'; rc=1
+  else
+    printf '  ok    no stray recorders\n'
+  fi
+
+  doctor_mic="$MIC"
+  [ "$doctor_mic" != auto ] || doctor_mic="$(pactl get-default-source 2>/dev/null || true)"
+  if [ -n "$doctor_mic" ] && pactl list short sources 2>/dev/null | grep -qF "$doctor_mic"; then
+    printf '  ok    mic   %s\n' "$MIC"
+  else
+    printf '  MISS  mic   %s\n' "$MIC"
+    printf '        available sources:\n'
+    pactl list short sources 2>/dev/null | awk '{printf "          %s\n", $2}'; rc=1
+  fi
+
+  # The example keyd/sxhkd integration uses F19 for a press/release binding.
+  # This check is informational; start/stop/toggle do not require this mapping.
+  if xmodmap -pke 2>/dev/null | grep -q '^keycode 197 = F19'; then
+    printf '  ok    keysym F19 on keycode 197\n'
+  else
+    printf '  warn  keycode 197 is not F19 — configure your own press/release binding if needed\n'
+  fi
+
+  # A held key can autorepeat, which may re-fire a press binding. The PID guard
+  # below survives it, but turning repeat off for the chosen key is preferable.
+  # xset prints a 256-bit mask, one bit per keycode, LSB-first within each byte.
+  mask="$(xset q | awk '/auto repeating keys/,/bell percent/' \
+          | grep -oE '\b[0-9a-f]{16}\b' | tr -d '\n')"
+  if [ "${#mask}" -eq 64 ]; then
+    # shellcheck disable=SC2017  # truncation is deliberate: byte index is
+    # floor(197/8)=24, then *2 for hex chars. 197*2/8=49 would be the wrong byte.
+    byte=$(( 0x${mask:$(( 197 / 8 * 2 )):2} ))
+    if (( (byte >> (197 % 8)) & 1 )); then
+      printf '  warn  autorepeat is ON for keycode 197 — run: xset -r 197\n'
+      printf '        (disable repeat for this key in your input configuration)\n'
+    else
+      printf '  ok    autorepeat off for keycode 197\n'
+    fi
+  else
+    printf '  warn  could not parse the xset autorepeat mask\n'
+  fi
+
+  exit $rc
+fi
+
+# ------------------------------------------------------------------ start
+start() {
+  # Mode: plain caps-lock = fast path only; ctrl+caps-lock ("start llm") writes
+  # "llm" and stop() runs the optional cleanup pass. Written before recording
+  # starts so stop() can trust it; cleared in stop().
+  MODE="fast"
+  [ "${1:-}" = "llm" ] && MODE="llm"
+  printf '%s\n' "$MODE" >"$MODEFILE"
+  # Idempotent: key autorepeat fires the sxhkd press binding repeatedly while
+  # Caps Lock is held, so every call after the first must be a no-op.
+  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$PIDFILE"
+
+  if [ ! -r "$MODEL" ]; then
+    notify "dictate: model missing" "$MODEL — run: dictate doctor" 5000
+    exit 1
+  fi
+
+  # Capture the full multichannel stream; the channel is extracted on stop.
+  # Both backends finalise the WAV header on SIGINT (parecord does not — killed
+  # mid-stream it leaves a bogus length field and whisper reads zero samples).
+  stop_preview          # clear any preview leaked by a crashed previous run
+  # Reap BEFORE unlinking: an orphan still holding $RAW open keeps writing to
+  # the unlinked inode, which ordinary directory listings cannot see. The
+  # recorder must be stopped before cleanup can reclaim the storage.
+  reap_recorders
+  if ! history_recover_abandoned; then
+    notify "dictate: cannot preserve previous capture" "see $LOG; recording not started" 5000
+    exit 1
+  fi
+  rm -f "$RAW"
+  date --iso-8601=seconds >"$STARTFILE"
+  pid="$(cap_bg "$RAW")"
+  echo "$pid" >"$PIDFILE"
+  notify "🎤 recording…" "" "$(( ${DICTATE_MAX_SECS:-300} * 1000 ))"
+
+  # Preview needs the resident server; repeatedly starting whisper-cli would
+  # reload the model for every tick and quickly fall behind.
+  if [ "$STREAM" = "1" ] && server_up; then
+    preview_loop & echo $! >"$PREVIEW_PIDFILE"
+  fi
+
+  # catch instant failures (mic unplugged, bad source name)
+  sleep 0.3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PIDFILE"
+    notify "dictate: recorder failed to start" "$(tail -2 "$LOG")" 5000
+    exit 1
+  fi
+
+}
+
+# ------------------------------------------------------------------ stop
+stop() {
+  RELEASE_TIMING_ACTIVE=1
+  printf 'event\ttimestamp\n' >"$RELEASE_TIMING" || true
+  release_mark command_started "$COMMAND_STARTED"
+  release_mark stop_entered
+  # No pidfile does not mean nothing is recording — that assumption is exactly
+  # how the orphan survived. Sweep for one, then process whatever it captured.
+  if [ ! -e "$PIDFILE" ]; then
+    stop_preview
+    reap_recorders
+    [ -s "$RAW" ] || return 0
+  else
+    pid="$(cat "$PIDFILE")"
+    rm -f "$PIDFILE"
+
+    stop_preview
+    notify "⏳ Transcribing" "" 30000
+    kill -INT "$pid" 2>/dev/null || true
+    release_mark recorder_stop_requested
+    # wait(1) only works on our own children; after nohup+& it is, but guard anyway
+    for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  fi
+
+  release_mark recorder_stopped
+  if [ ! -s "$RAW" ]; then
+    rm -f "$STARTFILE"
+    notify "dictate: no audio captured" "check the mic — dictate doctor" 4000
+    return 0
+  fi
+  if ! raw_to_mono16 "$RAW" "$WAV" || [ ! -s "$WAV" ]; then
+    history_archive_raw_failure "channel-extraction-failed"
+    if [ "$HISTORY_ENABLED" != "1" ] || [ -n "$HISTORY_ENTRY" ]; then
+      rm -f "$RAW" "$STARTFILE"
+    fi
+    if [ -n "$HISTORY_ENTRY" ]; then
+      notify "dictate: could not extract channel $CHAN" "raw audio retained; see $LOG" 4000
+    else
+      notify "dictate: could not extract channel $CHAN" "scratch audio kept; see $LOG" 4000
+    fi
+    return 0
+  fi
+
+  release_mark audio_prepared
+  # From here onward the recording is recoverable even if whisper, xdotool or
+  # this script crashes. The enormous multichannel raw file is no longer needed.
+  history_archive_audio "$WAV" "captured"
+  release_mark audio_archived
+  if [ "$HISTORY_ENABLED" != "1" ] || [ -n "$HISTORY_ENTRY" ]; then
+    rm -f "$RAW" "$STARTFILE"
+  fi
+
+  # Ignore sub-half-second blips: a stray Caps Lock tap that got past keyd's
+  # 200ms threshold shouldn't spin up a 1.5GB model.
+  dur="$(ffprobe -v quiet -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$WAV" 2>/dev/null || echo 0)"
+  if awk -v d="${dur:-0}" 'BEGIN { exit !(d < 0.5) }'; then
+    history_status "too-short"
+    notify "dictate: too short" "" 1200
+    return 0
+  fi
+
+  notify "⏳ transcribing…" "" 15000
+
+  vad=()
+  if [ "$USE_VAD" = "1" ] && [ -r "$VAD_MODEL" ]; then
+    vad=(--vad -vm "$VAD_MODEL" -vt "$VAD_THRESHOLD")
+  fi
+
+  # Measure the raw capture for the silence gate (~30ms, no re-encode).
+  peak="$(ffmpeg -nostdin -hide_banner -i "$WAV" -af volumedetect -f null - 2>&1 \
+          | awk '/max_volume/{print $(NF-1)}')"
+
+  # Optional experimental filter chain; empty by default (see FILTER above).
+  feed="$WAV"
+  if [ -n "$FILTER" ]; then
+    if ffmpeg -nostdin -hide_banner -loglevel error \
+         -i "$WAV" -af "$FILTER" -c:a pcm_s16le -y "$WAV_PROC" 2>>"$LOG"; then
+      feed="$WAV_PROC"
+    else
+      echo "warning: filter chain failed, feeding raw audio to whisper" >>"$LOG"
+    fi
+  fi
+
+  # Nothing but noise floor — don't spend a GPU pass to get " you" back.
+  if [ -n "$peak" ] && awk -v p="$peak" -v m="$MIN_PEAK" 'BEGIN{exit !(p < m)}'; then
+    history_status "silence"
+    notify "dictate: silence" "peak ${peak} dBFS" 1800
+    return 0
+  fi
+
+  release_mark audio_checked
+  history_status "transcribing"
+  release_mark transcription_started
+  if ! text="$(transcribe "$feed")"; then
+    history_status "transcription-failed"
+    notify "dictate: transcription failed" "audio retained in history; see $LOG" 4000
+    return 1
+  fi
+  release_mark transcription_finished
+  text="$(printf '%s' "$text" \
+          | tr '\n' ' ' \
+          | sed -e 's/\[[^]]*\]//g' -e 's/([^)]*)//g' \
+                -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/  */ /g')"
+
+  if [ -z "$text" ]; then
+    history_status "no-speech"
+    notify "dictate: no speech detected" "" 2500
+    return 0
+  fi
+
+  # Preserve whisper's wording even if the noise gate rejects it or the style
+  # transform changes it. This is the useful half of a transcription bug report.
+  history_text "$text" "transcript.raw.txt"
+
+  # LLM mode: repair misrecognized technical vocabulary before the deterministic
+  # restyle (which stays last so the noise blocklist above still matches
+  # whisper's own wording). Only on the ctrl+caps-lock path; any failure inside
+  # cleanup() returns the raw text unchanged, so this cannot lose a dictation.
+  # Read the mode BEFORE it is consumed below.
+  MODE="$(cat "$MODEFILE" 2>/dev/null || echo fast)"
+  rm -f "$MODEFILE"   # mode is one-shot: consumed by this stop() only
+  if [ "$MODE" = "llm" ] && [ "$LLM_CLEANUP" = 1 ] && [ -n "$LLM_KEY" ] && [ -n "$LLM_URL" ] && [ -n "$LLM_MODEL" ]; then
+    history_status "llm-cleaning"
+    notify "⏳ Polishing wording" "$text" "$(( (LLM_TIMEOUT + 5) * 1000 ))"
+    cleaned="$(cleanup "$text")"
+    [ -n "$cleaned" ] && [ "$cleaned" != "$text" ] \
+      && history_text "$cleaned" "transcript.cleaned.txt"
+    if [ -n "$cleaned" ]; then text="$cleaned"; fi
+  fi
+
+  # Belt and braces behind VAD: whisper's stock hallucinations on near-silence
+  # and room noise are a small, well-known set. Matched whole-string only, so a
+  # real sentence that merely starts with "so" or "okay" is never dropped.
+  norm="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:]' \
+          | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
+  if [ -z "$norm" ] || printf '%s' "$norm" | grep -qxE "$NOISE_PHRASES"; then
+    history_status "discarded-noise"
+    notify "dictate: discarded noise" "$text" 2000
+    return 0
+  fi
+
+  # Style last: the noise blocklist above matches on whisper's own wording, and
+  # restyling first would change what it is matching against.
+  text="$(restyle "$text")"
+  history_text "$text"
+  history_status "ready"
+  release_mark text_ready
+
+  if [ "${DICTATE_NOTYPE:-0}" = "1" ]; then
+    # Clipboard is the whole point in this mode, so no restore.
+    clip_set "$text"
+    history_status "copied-to-clipboard"
+    notify "📋 $text" "" "$OSD_DONE_MS"
+  else
+    notify "$text" "" "$OSD_DONE_MS"
+    release_mark overlay_submitted
+    # deliver() owns the clipboard from here: it must read the *previous*
+    # contents before overwriting them, so it cannot be pre-set above.
+    deliver "$text"
+    release_mark delivery_returned
+    # X11 offers no acknowledgement that the target consumed the paste; this
+    # deliberately says attempted, not delivered. `dictate retry` is the escape.
+    history_status "delivery-attempted"
+  fi
+}
+
+case "${1:-}" in
+  timings)
+    if [ "${2:-}" = release ]; then
+      exec python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/dictate-overlay/release_timings.py" "$RELEASE_TIMING"
+    fi
+    python3 - "$PREVIEW_TIMING" <<'PYTIMING'
+import csv, math, sys
+try:
+    with open(sys.argv[1]) as stream:
+        rows = list(csv.DictReader(stream, delimiter="\t"))
+except FileNotFoundError:
+    print("No preview timings yet. Record a dictation with live preview enabled.")
+    raise SystemExit(0)
+valid = []
+for row in rows:
+    try:
+        if row["status"] not in ("ok", "prepare_error", "request_error"):
+            continue
+        values = {k: float(row[k]) for k in ("prep_ms", "request_ms", "finish_ms", "work_ms", "start_gap_ms")}
+        if all(math.isfinite(v) and v >= 0 for v in values.values()):
+            valid.append((row["status"], values))
+    except (KeyError, ValueError, TypeError):
+        pass  # A running preview may still be appending its last row.
+print(f"Latest recording: {len(valid)} requests, {sum(s != 'ok' for s, _ in valid)} failures")
+print(f"{'milliseconds':18} {'min':>8} {'median':>8} {'p95':>8} {'max':>8}")
+for key, label in (("prep_ms", "Audio preparation"), ("request_ms", "ASR request"),
+                   ("finish_ms", "Text + submission"), ("work_ms", "Total work"), ("start_gap_ms", "Request interval")):
+    values = sorted(v[key] for status, v in valid if status == "ok" and (key != "start_gap_ms" or v[key] > 0))
+    if values:
+        import statistics
+        print(f"{label:18} {values[0]:8.1f} {statistics.median(values):8.1f} {values[math.ceil(.95*len(values))-1]:8.1f} {values[-1]:8.1f}")
+print("ASR request includes HTTP and response parsing; total work excludes waiting and display rendering.")
+print(f"Log: {sys.argv[1]}")
+PYTIMING
+    ;;
+  demo)
+    # Visual-only preview: no microphone, transcription, clipboard, or typing.
+    if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "Finish the current recording before running the demo." >&2
+      exit 1
+    fi
+    notify "🎤 recording…" "" 30000; sleep 1
+    notify "🎤 A quieter panel, with room to follow your thoughts." "" 30000; sleep 2
+    notify "🎤 A quieter panel, with room to follow your thoughts. Live text stays readable as you keep speaking." "" 30000; sleep 2
+    notify "⏳ Transcribing" "" 30000; sleep 2
+    notify "⏳ Polishing wording" "A quieter panel, with room to follow your thoughts." 30000; sleep 2
+    notify "A quieter panel, with room to follow your thoughts." "" "$OSD_DONE_MS"
+    ;;
+  start) start "${2:-}" ;;
+  stop)  stop ;;
+  toggle)
+    if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+      stop
+    else
+      start
+    fi
+    ;;
+  *) echo "usage: dictate {start|stop|toggle|demo|timings|doctor|level [secs]|meter|serve|scan [secs]|bench [wav]|history [n]|show [id|latest]|retry [id|latest]}" >&2
+     exit 1 ;;
+esac

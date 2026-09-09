@@ -1,0 +1,21 @@
+# Local configuration and credentials.
+**/config.toml
+config.local.toml
+.env
+.env.*
+
+# Dictation audio, transcripts, model files, and generated state.
+*.wav
+*.pcm
+*.raw
+*.bin
+*.png
+history/
+recordings/
+.cache/
+
+# Python and editor output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
