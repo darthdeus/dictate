@@ -17,19 +17,12 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
-    pub fn new(dir: PathBuf, enabled: bool) -> Result<Self> {
-        Ok(Self {
-            dir,
-            enabled,
-            max_days: std::env::var("DICTATE_HISTORY_DAYS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-            max_entries: std::env::var("DICTATE_HISTORY_MAX")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(200),
-        })
+    /// `ready` folds in storage usability (bash `HISTORY_READY`): a history
+    /// dir that could not be created degrades to disabled, never fatal.
+    /// Bounds come from the merged config (file values included), not just
+    /// the process environment.
+    pub fn new(dir: PathBuf, enabled: bool, max_days: u64, max_entries: usize) -> Result<Self> {
+        Ok(Self { dir, enabled, max_days, max_entries })
     }
 
     pub fn entries(&self) -> Result<Vec<PathBuf>> {
@@ -42,10 +35,7 @@ impl HistoryStore {
                 p.is_dir()
                     && p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| {
-                            n.len() >= 20
-                                && n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                        })
+                        .map(is_entry_name)
                         .unwrap_or(false)
             })
             .collect();
@@ -91,9 +81,7 @@ impl HistoryStore {
 
     fn read_opt(path: &Path) -> String {
         fs::read_to_string(path).unwrap_or_else(|_| "unknown".into())
-    }
-
-    /// `history [n]` table. Matches bash column layout.
+    }    /// `history [n]` table. Matches bash column layout.
     pub fn list(&self, limit: usize) -> Result<String> {
         let mut out = String::new();
         for (n, entry) in self.entries()?.into_iter().enumerate() {
@@ -197,9 +185,18 @@ impl HistoryStore {
         fs::create_dir_all(&tmp)?;
         fs::copy(audio, tmp.join("audio.wav"))?;
         fs::write(tmp.join("status"), format!("{status}\n"))?;
+        // Bash key order: id, started (caller extra), saved, duration, ...
+        // `saved`/`duration_seconds` are emitted here so every entry has
+        // them even when a caller forgets.
         let mut details = format!("id={id}\n");
         for (k, v) in extra_details {
             details.push_str(&format!("{k}={v}\n"));
+        }
+        if !extra_details.iter().any(|(k, _)| *k == "saved") {
+            details.push_str(&format!("saved={}\n", local_iso_now()));
+        }
+        if !extra_details.iter().any(|(k, _)| *k == "duration_seconds") {
+            details.push_str(&format!("duration_seconds={}\n", wav_duration(&tmp.join("audio.wav"))));
         }
         fs::write(tmp.join("details"), details)?;
         let entry = self.dir.join(&id);
@@ -231,6 +228,9 @@ impl HistoryStore {
         for (k, v) in extra_details {
             details.push_str(&format!("{k}={v}\n"));
         }
+        if !extra_details.iter().any(|(k, _)| *k == "saved") {
+            details.push_str(&format!("saved={}\n", local_iso_now()));
+        }
         fs::write(tmp.join("details"), details)?;
         let entry = self.dir.join(&id);
         fs::rename(&tmp, &entry)?;
@@ -238,7 +238,8 @@ impl HistoryStore {
         Ok(Some(entry))
     }
 
-    pub fn set_status(&self, entry: &Path, status: &str) {        let _ = fs::write(entry.join("status"), format!("{status}\n"));
+    pub fn set_status(&self, entry: &Path, status: &str) {
+        let _ = fs::write(entry.join("status"), format!("{status}\n"));
     }
 
     pub fn save_text(&self, entry: &Path, text: &str, name: &str) {
@@ -273,6 +274,65 @@ impl HistoryStore {
     }
 }
 
+/// Bash entry glob `20??-??-??_??-??-??-*`: dated prefix, then anything
+/// (pid, pid+counter). Tmp dirs (`.id.tmp`) never match the `20` prefix.
+fn is_entry_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    b.len() >= 21
+        && b.starts_with(b"20")
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'_'
+        && b[13] == b'-'
+        && b[16] == b'-'
+        && b[19] == b'-'
+        && b[..19]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| ![4, 7, 10, 13, 16].contains(i))
+            .all(|(_, c)| c.is_ascii_digit())
+}
+
+/// Local `date` output (bash uses the `date` binary everywhere for stamps).
+/// Falls back to UTC computation when `date` is unavailable.
+fn local_stamp() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d_%H-%M-%S")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| is_entry_name(&format!("{s}-x")))
+        .unwrap_or_else(chrono_stamp)
+}
+
+fn local_iso_now() -> String {
+    std::process::Command::new("date")
+        .arg("--iso-8601=seconds")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| s.len() >= 20)
+        .unwrap_or_else(|| format!("{}+00:00", chrono_iso_utc()))
+}
+
+/// `ffprobe` duration of an archived clip, or `unknown` (bash default when
+/// `ffprobe` yields nothing).
+fn wav_duration(wav: &Path) -> String {
+    std::process::Command::new("ffprobe")
+        .args(["-v", "quiet", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(wav)
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// `date '+%Y-%m-%d_%H-%M-%S'` without a subprocess.
 fn chrono_stamp() -> String {
     // Seconds since epoch -> civil date via libc gmtime. No `chrono` dep.
@@ -285,17 +345,40 @@ fn chrono_stamp() -> String {
 
 /// Uniqueness within a second: pid alone collides when tests archive twice
 /// in the same second, so each process appends a monotonic counter.
+/// (Bash uses `DATE-PID`; the counter keeps the entry glob/sort compatible.)
 fn unique_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}-{}", chrono_stamp(), std::process::id(), n)
+    format!("{}-{}-{}", local_stamp(), std::process::id(), n)
+}
+
+/// UTC `YYYY-MM-DDTHH:MM:SS` fallback when `date` is missing.
+fn chrono_iso_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    let date = civil_ymd(days);
+    format!("{date}T{:02}:{:02}:{:02}", sod / 3600, (sod % 3600) / 60, sod % 60)
 }
 
 fn civil_stamp(unix_secs: i64) -> String {
-    // Howard Hinnant's civil_from_days algorithm.
     let days = unix_secs.div_euclid(86400);
     let secs_of_day = unix_secs.rem_euclid(86400);
+    format!(
+        "{}_{:02}-{:02}-{:02}",
+        civil_ymd(days),
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
+fn civil_ymd(days: i64) -> String {
+    // Howard Hinnant's civil_from_days algorithm.
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 }.div_euclid(146097);
     let doe = (z - era * 146097) as u64;
@@ -306,13 +389,7 @@ fn civil_stamp(unix_secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
-        year, m, d,
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 #[cfg(test)]

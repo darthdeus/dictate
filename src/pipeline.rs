@@ -33,11 +33,22 @@ pub struct Ctx {
     pub overlay_path: PathBuf,
     pub log: PathBuf,
     pub command_started: f64,
+    /// Release-timing TSV is written only inside `stop` (bash
+    /// `RELEASE_TIMING_ACTIVE`); `retry`/`deliver` otherwise stay silent.
+    pub timing_active: std::cell::Cell<bool>,
 }
 
 impl Ctx {
-    pub fn new(cfg: Config, paths: Paths) -> Result<Self> {
-        let history = HistoryStore::new(paths.history_dir.clone(), paths.history_enabled)?;
+    pub fn new(cfg: Config, paths: Paths, history_ready: bool) -> Result<Self> {
+        // `ensure_private_dirs` reports whether history storage is usable;
+        // a mkdir failure degrades to disabled (bash `HISTORY_READY=0`),
+        // never to aborting the dictation.
+        let history = HistoryStore::new(
+            paths.history_dir.clone(),
+            paths.history_enabled && history_ready,
+            cfg.get("DICTATE_HISTORY_DAYS").unwrap_or("30").parse().unwrap_or(30),
+            cfg.get("DICTATE_HISTORY_MAX").unwrap_or("200").parse().unwrap_or(200),
+        )?;
         Ok(Self {
             state: RecordingState {
                 pidfile: paths.pidfile.clone(),
@@ -50,7 +61,28 @@ impl Ctx {
             paths,
             history,
             command_started: now_unix(),
+            timing_active: std::cell::Cell::new(false),
         })
+    }
+
+    /// Bash `release_mark`: appends `event<TAB>timestamp`, but only while
+    /// this process is a `stop` with an active TSV.
+    pub fn mark(&self, event: &str) {
+        if self.timing_active.get() {
+            release_mark(&self.paths, event);
+        }
+    }
+
+    pub fn mark_at(&self, event: &str, ts: f64) {
+        if self.timing_active.get() {
+            release_mark_at(&self.paths, event, ts);
+        }
+    }
+
+    /// TSV path for stages owned by other modules (paste shortcut).
+    /// `None` outside `stop`, where no TSV is active.
+    pub fn timing_tsv(&self) -> Option<&Path> {
+        self.timing_active.get().then_some(self.paths.release_timing.as_path())
     }
 
     fn c(&self, key: &str, default: &str) -> String {
@@ -76,11 +108,13 @@ impl Ctx {
         self.c("DICTATE_MAX_SECS", "300").parse().unwrap_or(300)
     }
     fn model(&self) -> String {
-        self.c(
-            "DICTATE_MODEL",
-            &format!("{}/.local/share/whisper/ggml-large-v3-turbo.bin",
-                std::env::var("HOME").unwrap_or_default()),
-        )
+        self.c("DICTATE_MODEL", &default_model_file("ggml-large-v3-turbo.bin"))
+    }
+    fn parakeet_model(&self) -> String {
+        self.c("DICTATE_PARAKEET_MODEL", &default_model_file("ggml-parakeet-tdt-0.6b-v3-f16.bin"))
+    }
+    fn vad_model(&self) -> String {
+        self.c("DICTATE_VAD_MODEL", &default_model_file("ggml-silero-v5.1.2.bin"))
     }
     fn server(&self) -> String {
         // Explicit empty forces CLI; unset means default URL.
@@ -105,6 +139,12 @@ impl Ctx {
 
 pub fn now_unix() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// Default model locations (bash `MODEL`/`PARAKEET_MODEL`/`VAD_MODEL`
+/// defaults, shared by stop/doctor/bench so all three agree).
+fn default_model_file(name: &str) -> String {
+    format!("{}/.local/share/whisper/{name}", std::env::var("HOME").unwrap_or_default())
 }
 
 fn uid_string() -> String {
@@ -132,6 +172,10 @@ fn append_log(log: &Path, line: &str) {
 
 /// Never-failing overlay/dashboard notification (bash `notify` returns 0).
 /// Writes state.json atomically and spawns the singleton renderer detached.
+///
+/// GTK only: `DICTATE_OSD_BACKEND=feh` is honored by `bin/dictate` alone
+/// (see README port notes). Under `feh` the state.json is still published
+/// for protocol compatibility, but no GTK renderer is spawned.
 pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
     let (phase, label, text) = map_notify(title, body);
     let msg = OverlayMessage {
@@ -146,6 +190,9 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
     };
     let writer = JsonFileOverlay { state_path: ctx.overlay_path.clone() };
     if writer.show(&msg).is_err() {
+        return;
+    }
+    if ctx.cfg.get("DICTATE_OSD_BACKEND").unwrap_or("gtk") == "feh" {
         return;
     }
     spawn_renderer(&ctx.log);
@@ -183,9 +230,19 @@ fn spawn_renderer(log: &Path) {
         cmd.stdin(std::process::Stdio::null());
     }
     match logfile {
-        Some(f) => {
-            let _ = cmd.stdout(f.try_clone().unwrap()).stderr(f).spawn();
-        }
+        // A fd that cannot be cloned is not worth failing (or panicking)
+        // a notification over: fall back to a null output.
+        Some(f) => match f.try_clone() {
+            Ok(out) => {
+                let _ = cmd.stdout(out).stderr(f).spawn();
+            }
+            Err(_) => {
+                let _ = cmd
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        },
         None => {
             let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
         }
@@ -195,9 +252,13 @@ fn spawn_renderer(log: &Path) {
 // ------------------------------------------------------------ release marks
 
 fn release_mark(paths: &Paths, event: &str) {
+    release_mark_at(paths, event, now_unix())
+}
+
+fn release_mark_at(paths: &Paths, event: &str, ts: f64) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&paths.release_timing) {
-        let _ = writeln!(f, "{event}\t{:.6}", now_unix());
+        let _ = writeln!(f, "{event}\t{ts:.6}");
     }
 }
 
@@ -303,17 +364,27 @@ fn recover_abandoned(ctx: &Ctx) -> Result<()> {
     let recovered = ctx.paths.datadir.join(format!("dictate-recovered-{}.wav", std::process::id()));
     let converted = ctx.audio().mono16_with_channels(&ctx.paths.raw, &recovered, ctx.chan(), ctx.channels()).is_ok()
         && std::fs::metadata(&recovered).map(|m| m.len() > 0).unwrap_or(false);
+    // History I/O is best-effort (bash warns and continues with
+    // `HISTORY_ENTRY=""`); a history-dir problem must not abort the capture.
+    let warn = |e: anyhow::Error| append_log(&ctx.log, &format!("warning: could not archive dictation audio: {e:#}"));
     let entry = if converted {
-        ctx.history.archive_audio(&recovered, "recovered-after-crash",
+        match ctx.history.archive_audio(&recovered, "recovered-after-crash",
             &[("engine", &ctx.c("DICTATE_ENGINE", "whisper")),
               ("mic", &ctx.mic()),
-              ("channel", &format!("{}/{}", ctx.chan(), ctx.channels()))])?
+              ("channel", &format!("{}/{}", ctx.chan(), ctx.channels()))]) {
+            Ok(e) => e,
+            Err(e) => { warn(e); None }
+        }
     } else {
         let mic = ctx.mic();
-        let chans = format!("{}/{}", ctx.chan(), ctx.channels());
-        ctx.history.archive_raw_audio(
+        let channel = format!("{}/{}", ctx.chan(), ctx.channels());
+        let raw_format = format!("s16le,48000Hz,{}ch", ctx.channels());
+        match ctx.history.archive_raw_audio(
             &ctx.paths.raw, "raw-recovered-after-crash",
-            &[("mic", mic.as_str()), ("channels", chans.as_str())])?
+            &[("mic", mic.as_str()), ("channel", channel.as_str()), ("raw_format", raw_format.as_str())]) {
+            Ok(e) => e,
+            Err(e) => { warn(e); None }
+        }
     };
     if ctx.history.enabled && entry.is_none() {
         // Archival failed: move aside before the new capture takes the name.
@@ -409,15 +480,19 @@ pub fn is_silence(peak_db: Option<f32>, min_peak_db: f64) -> bool {
 /// hard transcription failure returns Err (bash `return 1`).
 pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
     let _ = std::fs::write(&ctx.paths.release_timing, "event\ttimestamp\n");
-    let mark = |e: &str| release_mark(&ctx.paths, e);
+    ctx.timing_active.set(true);
+    // Process-start timestamp, not stop entry (bash `command_started`).
+    let started_ts = ctx.command_started;
+    ctx.mark_at("command_started", started_ts);
+    ctx.mark("stop_entered");
     // No pidfile != not recording (orphan sweep, like bash).
     let recorded = if ctx.paths.pidfile.exists() {
         let pid = ctx.state.take_recorded_pid();
         stop_preview(&ctx.paths);
-        notify(ctx, "\u{23f3} Transcribing", "", 30000);
+        notify(ctx, "⏳ Transcribing", "", 30000);
         if let Some(pid) = pid {
             state::send_int(pid);
-            mark("recorder_stop_requested");
+            ctx.mark("recorder_stop_requested");
             state::wait_exit(pid, 50);
         }
         Some(())
@@ -430,7 +505,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         None
     };
     let _ = recorded;
-    mark("recorder_stopped");
+    ctx.mark("recorder_stopped");
 
     if std::fs::metadata(&ctx.paths.raw).map(|m| m.len() == 0).unwrap_or(true) {
         let _ = std::fs::remove_file(&ctx.paths.startfile);
@@ -441,10 +516,17 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         || std::fs::metadata(&ctx.paths.wav).map(|m| m.len() == 0).unwrap_or(true)
     {
         let mic = ctx.mic();
-        let chans = format!("{}/{}", ctx.chan(), ctx.channels());
+        let channel = format!("{}/{}", ctx.chan(), ctx.channels());
+        let raw_format = format!("s16le,48000Hz,{}ch", ctx.channels());
+        // Best-effort: a history failure keeps scratch audio and continues
+        // to the user notice (bash `HISTORY_ENTRY=""` + branch below).
         let entry = ctx.history.archive_raw_audio(
             &ctx.paths.raw, "channel-extraction-failed",
-            &[("mic", mic.as_str()), ("channels", chans.as_str())])?;
+            &[("mic", mic.as_str()), ("channel", channel.as_str()), ("raw_format", raw_format.as_str())])
+            .unwrap_or_else(|e| {
+                append_log(&ctx.log, &format!("warning: could not archive failed raw capture: {e:#}"));
+                None
+            });
         if !ctx.history.enabled || entry.is_some() {
             let _ = std::fs::remove_file(&ctx.paths.raw);
             let _ = std::fs::remove_file(&ctx.paths.startfile);
@@ -459,16 +541,22 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    mark("audio_prepared");
+    ctx.mark("audio_prepared");
     let started = std::fs::read_to_string(&ctx.paths.startfile).unwrap_or_else(|_| iso_now());
     let started = started.trim().to_string();
+    // Best-effort like bash: transcription/delivery proceed even when the
+    // archive fails; only the entry-gated status updates are skipped.
     let entry = ctx.history.archive_audio(&ctx.paths.wav, "captured",
         &[("started", started.as_str()),
           ("engine", ctx.c("DICTATE_ENGINE", "whisper").as_str()),
           ("mic", ctx.mic().as_str()),
           ("channel", &format!("{}/{}", ctx.chan(), ctx.channels())),
-          ("mode", ctx.state.read_mode().as_str())])?;
-    mark("audio_archived");
+          ("mode", ctx.state.read_mode().as_str())])
+        .unwrap_or_else(|e| {
+            append_log(&ctx.log, &format!("warning: could not archive dictation audio: {e:#}"));
+            None
+        });
+    ctx.mark("audio_archived");
     if !ctx.history.enabled || entry.is_some() {
         let _ = std::fs::remove_file(&ctx.paths.raw);
         let _ = std::fs::remove_file(&ctx.paths.startfile);
@@ -489,9 +577,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         &ctx.c("DICTATE_LANG", "auto"), &ctx.c("DICTATE_PROMPT", ""),
         ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8));
     if ctx.c("DICTATE_VAD", "0") == "1" {
-        let vm = ctx.c("DICTATE_VAD_MODEL",
-            &format!("{}/.local/share/whisper/ggml-silero-v5.1.2.bin",
-                std::env::var("HOME").unwrap_or_default()));
+        let vm = ctx.vad_model();
         if Path::new(&vm).exists() {
             whisper.vad_model = Some(vm);
             whisper.vad_threshold = ctx.c("DICTATE_VAD_THRESHOLD", "0.5");
@@ -518,21 +604,19 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    mark("audio_checked");
+    ctx.mark("audio_checked");
     if let Some(e) = &entry {
         ctx.history.set_status(e, "transcribing");
     }
-    mark("transcription_started");
+    ctx.mark("transcription_started");
     let raw_text = match ctx.engine() {
         Engine::Parakeet => {
             let pc = ParakeetConfig {
-                model: ctx.c("DICTATE_PARAKEET_MODEL",
-                    &format!("{}/.local/share/whisper/ggml-parakeet-tdt-0.6b-v3-f16.bin",
-                        std::env::var("HOME").unwrap_or_default())),
+                model: ctx.parakeet_model(),
                 threads: ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8),
                 bin: "parakeet-cli".into(),
             };
-            transcribe::transcribe_parakeet(&feed, &pc)
+            transcribe::transcribe_parakeet(&feed, &pc, &ctx.log)
         }
         Engine::Whisper => transcribe::transcribe_whisper(&feed, &whisper, &ctx.log),
     };
@@ -543,7 +627,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
         anyhow::bail!("dictate: transcription failed");
     };
-    mark("transcription_finished");
+    ctx.mark("transcription_finished");
     let mut text = text::clean_whisper_text(&raw_text);
     if text.is_empty() {
         if let Some(e) = &entry {
@@ -592,7 +676,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         ctx.history.save_text(e, &text, "transcript.txt");
         ctx.history.set_status(e, "ready");
     }
-    mark("text_ready");
+    ctx.mark("text_ready");
 
     if ctx.c("DICTATE_NOTYPE", "0") == "1" {
         ctx.clipboard().set(&text)?;
@@ -602,9 +686,9 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         notify(ctx, &format!("\u{1f4cb} {text}"), "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
     } else {
         notify(ctx, &text, "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
-        mark("overlay_submitted");
+        ctx.mark("overlay_submitted");
         deliver(ctx, &text);
-        mark("delivery_returned");
+        ctx.mark("delivery_returned");
         if let Some(e) = &entry {
             ctx.history.set_status(e, "delivery-attempted");
         }
@@ -654,12 +738,26 @@ fn llm_cleanup(ctx: &Ctx, raw: &str) -> String {
             {"role": "user", "content": raw}
         ]
     });
-    let out = std::process::Command::new("curl")
-        .args(["-sf", "--connect-timeout", "2", "--max-time", &timeout, url])
-        .args(["-H", &format!("Authorization: Bearer {key}"), "-H", "Content-Type: application/json"])
-        .args(["-d", &body.to_string()])
-        .output();
-    let Ok(out) = out else {
+    // Payload via stdin (`-d @-`, like bash): long dictations must not
+    // ride argv (ARG_MAX), and the body has no business in `ps`. (Bash
+    // already exposes the key header on argv; we keep that parity.)
+    let out = (|| {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = std::process::Command::new("curl")
+            .args(["-sf", "--connect-timeout", "2", "--max-time", &timeout, url])
+            .args(["-H", &format!("Authorization: Bearer {key}"), "-H", "Content-Type: application/json"])
+            .args(["-d", "@-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.as_mut()?.write_all(body.to_string().as_bytes()).ok()?;
+        drop(child.stdin.take());
+        child.wait_with_output().ok()
+    })();
+    let Some(out) = out else {
         append_log(&ctx.log, "note: llm cleanup failed/timed out, keeping raw text");
         return raw.to_string();
     };
@@ -700,27 +798,32 @@ pub fn deliver(ctx: &Ctx, text: &str) {
         }
         DeliveryAction::Paste { chord } => {
             let clip = ctx.clipboard();
+            ctx.mark("clipboard_backend_selected");
             let prev = if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" { clip.get() } else { String::new() };
+            ctx.mark("clipboard_saved");
             if clip.set(text).is_err() {
                 let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
                 return;
             }
+            ctx.mark("clipboard_set");
             if !delivery::wait_clipboard(|| clip.get(), text, 10) {
                 append_log(&ctx.log, "note: clipboard not ready, typing instead");
                 let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
                 return;
             }
-            let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), &ctx.log);
+            ctx.mark("clipboard_verified");
+            let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), ctx.timing_tsv());
             if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" && !prev.is_empty() {
+                // Detached re-execution outlives `stop` (bash background
+                // subshell); a thread here would die with the process before
+                // the settle delay elapsed and never restore.
                 let settle: f64 = ctx.c("DICTATE_PASTE_SETTLE", "0.4").parse().unwrap_or(0.4);
-                let clip2 = clip.clone();
-                let (prev, text) = (prev.clone(), text.to_string());
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(settle.max(0.0)));
-                    if delivery::should_restore_clipboard(&clip2.get(), &text) {
-                        let _ = clip2.set(&prev);
-                    }
-                });
+                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dictate"));
+                if delivery::schedule_detached_restore(
+                    &ctx.paths.datadir, &exe, &clip, text, &prev, settle,
+                ).is_err() {
+                    append_log(&ctx.log, "note: clipboard restore unavailable, keeping dictation text");
+                }
             }
         }
     }
@@ -786,62 +889,82 @@ pub fn cmd_demo(ctx: &Ctx) -> Result<()> {
 // ------------------------------------------------------------------- doctor
 
 /// Full `dictate doctor` port. Returns exit code (0 ok, 1 problems).
+/// Levels mirror bash: `ok`, non-fatal `warn`, fatal `MISS` (rc=1).
 pub fn cmd_doctor(ctx: &Ctx) -> i32 {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Level {
+        Ok,
+        Warn,
+        Miss,
+    }
     let mut rc = 0;
-    let mut show = |ok: bool, fatal: bool, msg: String| {
-        if !ok && fatal {
+    let mut show = |level: Level, msg: String| {
+        if level == Level::Miss {
             rc = 1;
         }
-        let tag = if ok { "ok" } else if fatal { "MISS" } else { "warn" };
+        let tag = match level {
+            Level::Ok => "ok",
+            Level::Warn => "warn",
+            Level::Miss => "MISS",
+        };
         println!("  {tag}    {msg}");
     };
     for b in ["ffmpeg", "ffprobe", "xdotool", "pactl", "jq", "curl", "python3", "timeout", "flock", "pgrep", "pkill", "awk", "sha256sum"] {
         let found = crate::doctor::lookup_in_path(b);
-        show(found, true, b.to_string());
+        show(if found { Level::Ok } else { Level::Miss }, b.to_string());
     }
     if crate::doctor::lookup_in_path("pw-record") {
-        show(true, false, "pw-record (PipeWire capture)".into());
+        show(Level::Ok, "pw-record (PipeWire capture)".into());
     } else {
-        show(true, false, "warn pw-record missing — ffmpeg PulseAudio capture will be used".into());
+        show(Level::Warn, "pw-record missing — ffmpeg PulseAudio capture will be used".into());
     }
     if crate::doctor::lookup_in_path("dunstify") || crate::doctor::lookup_in_path("notify-send") {
-        show(true, false, "desktop notifications (failure fallback)".into());
+        show(Level::Ok, "desktop notifications (failure fallback)".into());
     } else {
-        show(true, false, "warn no desktop notification command — overlay failures only reach the log".into());
+        show(Level::Warn, "no desktop notification command — overlay failures only reach the log".into());
     }
     if ctx.c("DICTATE_OSD_BACKEND", "gtk") == "gtk" {
-        show(crate::doctor::lookup_in_path("nix-build"), true, "nix-build (GTK overlay runtime)".into());
+        show(
+            if crate::doctor::lookup_in_path("nix-build") { Level::Ok } else { Level::Miss },
+            "nix-build (GTK overlay runtime)".into(),
+        );
     } else {
-        for b in ["feh", "magick"] {
-            show(crate::doctor::lookup_in_path(b), true, format!("{b} (legacy overlay)"));
-        }
+        // Non-fatal: the feh image backend is bash-only (see README port
+        // notes); text delivery still works, only the overlay stays dark.
+        show(Level::Warn, "DICTATE_OSD_BACKEND=feh is bash-only; this binary shows no overlay".into());
     }
     let (engine_bin, engine_label, model) = match ctx.engine() {
-        Engine::Parakeet => ("parakeet-cli", "parakeet-cli (selected engine)",
-            ctx.c("DICTATE_PARAKEET_MODEL", &format!("{}/.local/share/whisper/ggml-parakeet-tdt-0.6b-v3-f16.bin",
-                std::env::var("HOME").unwrap_or_default()))),
+        Engine::Parakeet => ("parakeet-cli", "parakeet-cli (selected engine)", ctx.parakeet_model()),
         Engine::Whisper => ("whisper-cli", "whisper-cli (selected engine)", ctx.model()),
     };
-    show(crate::doctor::lookup_in_path(engine_bin), true, engine_label.into());
+    show(
+        if crate::doctor::lookup_in_path(engine_bin) { Level::Ok } else { Level::Miss },
+        engine_label.into(),
+    );
     if Path::new(&model).exists() {
-        show(true, false, format!("model {model}"));
+        show(Level::Ok, format!("model {model}"));
     } else {
-        show(false, true, format!("model {model}"));
+        show(Level::Miss, format!("model {model}"));
         println!("        install whisper.cpp and download a compatible ggml model");
         println!("        see the project README for setup instructions");
     }
     if ctx.c("DICTATE_VAD", "0") == "1" {
-        let vm = ctx.c("DICTATE_VAD_MODEL", "");
-        show(Path::new(&vm).exists(), true, format!("vad   enabled, {vm}"));
+        // Same default as stop: an unset key still resolves to the standard
+        // Silero model instead of reporting a missing empty path.
+        let vm = ctx.vad_model();
+        show(
+            if Path::new(&vm).exists() { Level::Ok } else { Level::Miss },
+            format!("vad   enabled, {vm}"),
+        );
     } else {
-        show(true, false, "vad   disabled (enable with DICTATE_VAD=1 if needed)".into());
+        show(Level::Ok, "vad   disabled (enable with DICTATE_VAD=1 if needed)".into());
     }
     if ctx.engine() == Engine::Parakeet {
-        show(true, false, "server not used by parakeet engine".into());
+        show(Level::Ok, "server not used by parakeet engine".into());
     } else if server_up(&ctx.server()) {
-        show(true, false, format!("server {} (resident)", ctx.server()));
+        show(Level::Ok, format!("server {} (resident)", ctx.server()));
     } else {
-        show(true, false, format!("warn server {} unreachable — falling back to whisper-cli", ctx.server()));
+        show(Level::Warn, format!("server {} unreachable — falling back to whisper-cli", ctx.server()));
         println!("        start it with: dictate serve");
     }
     // Disk space (>1GiB free required).
@@ -850,25 +973,30 @@ pub fn cmd_doctor(ctx: &Ctx) -> i32 {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    show(crate::doctor::df_has_space(&df), true,
-        format!("space on {}", ctx.paths.datadir.display()));
+    show(
+        if crate::doctor::df_has_space(&df) { Level::Ok } else { Level::Miss },
+        format!("space on {}", ctx.paths.datadir.display()),
+    );
     // History.
     if ctx.history.enabled {
-        show(ctx.paths.history_dir.is_dir(), true, format!("history {}", ctx.paths.history_dir.display()));
+        show(
+            if ctx.paths.history_dir.is_dir() { Level::Ok } else { Level::Miss },
+            format!("history {}", ctx.paths.history_dir.display()),
+        );
     } else {
-        show(true, false, "warn history disabled — failed pastes and audio will not be retained".into());
+        show(Level::Warn, "history disabled — failed pastes and audio will not be retained".into());
     }
     // Stray recorders.
     let strays = state::stray_recorder_pids(&uid_string(), state::RECORDER_PATTERN);
     if strays.is_empty() {
-        show(true, false, "no stray recorders".into());
+        show(Level::Ok, "no stray recorders".into());
     } else {
-        show(false, true, format!("stray recorder(s) still running: {strays:?}"));
+        show(Level::Miss, format!("stray recorder(s) still running: {strays:?}"));
         println!("        they hold disk even after deletion — fix: dictate stop");
     }
     // Mic present in pactl sources.
     let mic_ok = mic_present(&ctx.mic());
-    show(mic_ok, true, format!("mic   {}", ctx.mic()));
+    show(if mic_ok { Level::Ok } else { Level::Miss }, format!("mic   {}", ctx.mic()));
     if !mic_ok {
         println!("        available sources:");
         if let Ok(o) = std::process::Command::new("pactl").args(["list", "short", "sources"]).output() {
@@ -879,13 +1007,37 @@ pub fn cmd_doctor(ctx: &Ctx) -> i32 {
             }
         }
     }
-    // F19 keysym (informational).
+    // The example keyd/sxhkd integration uses F19 for a press/release
+    // binding. Informational; start/stop/toggle do not require it.
     let f19 = std::process::Command::new("xmodmap").args(["-pke"]).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("keycode 197 = F19"))
         .unwrap_or(false);
-    show(f19, false, if f19 { "keysym F19 on keycode 197".into() }
-        else { "warn keycode 197 is not F19 — configure your own press/release binding if needed".into() });
+    show(
+        if f19 { Level::Ok } else { Level::Warn },
+        if f19 { "keysym F19 on keycode 197".into() }
+        else { "keycode 197 is not F19 — configure your own press/release binding if needed".into() },
+    );
+    // A held key can autorepeat and re-fire the press binding; the pidfile
+    // guard survives it, but repeat-off for the key is preferable (bash
+    // parses the same xset 256-bit mask, LSB-first within each byte).
+    match autorepeat_197() {
+        None => show(Level::Warn, "could not parse the xset autorepeat mask".into()),
+        Some(true) => {
+            show(Level::Warn, "autorepeat is ON for keycode 197 — run: xset -r 197".into());
+            println!("        (disable repeat for this key in your input configuration)");
+        }
+        Some(false) => show(Level::Ok, "autorepeat off for keycode 197".into()),
+    }
     rc
+}
+
+/// `Some(true)` when autorepeat is ON for keycode 197, `Some(false)` when
+/// off, `None` when the `xset` mask cannot be parsed.
+fn autorepeat_197() -> Option<bool> {
+    let out = std::process::Command::new("xset").arg("q").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mask = crate::doctor::extract_xset_mask(&text)?;
+    crate::doctor::autorepeat_enabled_for_key(&mask, 197)
 }
 
 fn mic_present(mic: &str) -> bool {
@@ -914,8 +1066,8 @@ pub fn cmd_level(ctx: &Ctx, secs: u64) -> Result<()> {
     println!("Speak normally, at your usual distance and volume…");
     let raw = ctx.paths.datadir.join("dictate-level-raw.wav");
     let tmp = ctx.paths.datadir.join("dictate-level.wav");
-    cap_secs(ctx, &raw, secs)?;
-    ctx.audio().mono16_with_channels(&raw, &tmp, ctx.chan(), ctx.channels())?;
+    cap_secs(ctx, &raw, secs, ctx.channels())?;
+    ctx.audio().wav_to_mono16(&raw, &tmp, ctx.chan())?;
     let (peak, rms) = audio::parse_astats_peak_rms(&astats_output(&tmp));
     println!("\n  peak {:>8} dBFS", peak.map(|p| format!("{p:.1}")).unwrap_or_else(|| "?".into()));
     println!("  rms  {:>8} dBFS\n", rms.map(|r| format!("{r:.1}")).unwrap_or_else(|| "?".into()));
@@ -928,26 +1080,33 @@ pub fn cmd_level(ctx: &Ctx, secs: u64) -> Result<()> {
     Ok(())
 }
 
-fn cap_secs(ctx: &Ctx, dest: &Path, secs: u64) -> Result<()> {
+/// Bounded capture for `level`/`scan` (WAV output regardless of backend:
+/// `pw-record`'s default container, or ffmpeg `pcm_s16le` into `*.wav`).
+/// `channels` is explicit so `scan` records the pactl-detected width, not
+/// the configured single channel (bash `CHANNELS="$nch"`).
+fn cap_secs(ctx: &Ctx, dest: &Path, secs: u64, channels: u32) -> Result<()> {
     let audio = ctx.audio();
-    let status = if audio.use_pw_record() {
-        std::process::Command::new("timeout")
+    if audio.use_pw_record() {
+        // `timeout -s INT` exits 124 after a successful timed capture;
+        // bash `cap_secs` ignores it (`|| true`). Spawn errors still fail.
+        let _ = std::process::Command::new("timeout")
             .args(["-s", "INT", &secs.to_string(), "pw-record",
                 "--target", &ctx.mic(), "--rate", "48000",
-                "--channels", &ctx.channels().to_string(), "--format", "s16"])
-            .arg(dest).status()?
+                "--channels", &channels.to_string(), "--format", "s16"])
+            .arg(dest).status()?;
+        Ok(())
     } else {
-        std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new("ffmpeg")
             .args(["-nostdin", "-hide_banner", "-loglevel", "error",
-                "-f", "pulse", "-channels", &ctx.channels().to_string(),
+                "-f", "pulse", "-channels", &channels.to_string(),
                 "-i", &ctx.pulse_mic(), "-t", &secs.to_string(),
                 "-c:a", "pcm_s16le", "-y"])
-            .arg(dest).status()?
-    };
-    if !status.success() {
-        anyhow::bail!("dictate: capture failed");
+            .arg(dest).status()?;
+        if !audio::bounded_capture_ok(status) {
+            anyhow::bail!("dictate: capture failed");
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn astats_output(wav: &Path) -> String {
@@ -1123,7 +1282,10 @@ pub fn cmd_scan(ctx: &Ctx, secs: u64) -> Result<()> {
     println!("Channels: {nch}\n");
     println!("SPEAK NORMALLY for {secs}s — talk continuously so quiet channels stand out.");
     let tmp = ctx.paths.datadir.join("dictate-scan.wav");
-    cap_secs(ctx, &tmp, secs)?;
+    // Record the detected width, not the configured channel: a 10-input
+    // interface must actually be captured at 10 channels (bash sets
+    // `CHANNELS="$nch"` before `cap_secs`).
+    cap_secs(ctx, &tmp, secs, nch)?;
     println!();
     for c in 0..nch {
         let (peak, rms) = channel_astats(&tmp, c);
@@ -1207,12 +1369,14 @@ pub fn cmd_bench(ctx: &Ctx, wav: Option<&str>) -> Result<()> {
             }
         }
     }
-    let pm = ctx.c("DICTATE_PARAKEET_MODEL", "");
-    if !pm.is_empty() && Path::new(&pm).exists() {
+    // Same default model path as stop/doctor: an unset key still benches
+    // the standard model instead of silently skipping parakeet.
+    let pm = ctx.parakeet_model();
+    if Path::new(&pm).exists() {
         let pc = ParakeetConfig { model: pm, threads: ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8), bin: "parakeet-cli".into() };
-        let _ = transcribe::transcribe_parakeet(&wav, &pc);
+        let _ = transcribe::transcribe_parakeet(&wav, &pc, &ctx.log);
         let s = now_unix();
-        let txt = transcribe::transcribe_parakeet(&wav, &pc).unwrap_or_default();
+        let txt = transcribe::transcribe_parakeet(&wav, &pc, &ctx.log).unwrap_or_default();
         let t: String = txt.chars().flat_map(|c| if c.is_whitespace() { Some(' ') } else { Some(c) }).collect();
         println!("  {:<20} {:5.2}s  {}", "parakeet-tdt-v3", now_unix() - s, t.trim());
     }
@@ -1266,23 +1430,10 @@ pub fn run_preview_worker(ctx: &Ctx) -> Result<()> {
         if !ctx.paths.pidfile.exists() {
             break;
         }
-        if gate_enabled {
-            let end = std::fs::metadata(&ctx.paths.raw).map(|m| m.len()).unwrap_or(0);
-            if end < file_offset {
-                file_offset = 0; // truncation resets gate (bash parity)
-            }
-            let frame_bytes = (ctx.channels() as u64) * 2;
-            let start = file_offset.max(end.saturating_sub(96000 * frame_bytes));
-            let new_data = read_range(&ctx.paths.raw, start, end);
-            file_offset = end;
-            let samples = bytes_to_i16(&new_data);
-            if !gate.scan(&samples, now_unix()) {
-                std::thread::sleep(std::time::Duration::from_secs_f64(0.04));
-                if !ctx.paths.pidfile.exists() {
-                    break;
-                }
-                continue;
-            }
+        // Energy gate with its own 40ms quiet poll (preview_gate.py parity):
+        // silence waits here without consuming the start-to-start interval.
+        if gate_enabled && !wait_for_voice(ctx, &mut gate, &mut file_offset, deadline) {
+            break;
         }
         if !ctx.paths.pidfile.exists() {
             break;
@@ -1343,6 +1494,37 @@ pub fn run_preview_worker(ctx: &Ctx) -> Result<()> {
         previous = t0;
     }
     Ok(())
+}
+
+/// Block (40ms polls) until the energy gate fires, the recording ends, or
+/// the deadline passes. Truncation (recorder restarted under us) resets both
+/// the file offset and the gate's voice/settle state, so a pending settle
+/// can never fire on the new file. Mirrors `preview_gate.py`'s inner loop.
+fn wait_for_voice(
+    ctx: &Ctx,
+    gate: &mut crate::preview::EnergyGate,
+    file_offset: &mut u64,
+    deadline: f64,
+) -> bool {
+    loop {
+        if !ctx.paths.pidfile.exists() || now_unix() >= deadline {
+            return false;
+        }
+        let end = std::fs::metadata(&ctx.paths.raw).map(|m| m.len()).unwrap_or(0);
+        if end < *file_offset {
+            *file_offset = 0;
+            gate.reset();
+        }
+        let frame_bytes = (ctx.channels() as u64) * 2;
+        // Bound catch-up work to the last 2s (96000 frames at 48kHz).
+        let start = (*file_offset).max(end.saturating_sub(96000 * frame_bytes));
+        let samples = bytes_to_i16(&read_range(&ctx.paths.raw, start, end));
+        *file_offset = end;
+        if gate.scan(&samples, now_unix()) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs_f64(0.04));
+    }
 }
 
 fn read_range(path: &Path, start: u64, end: u64) -> Vec<u8> {
@@ -1406,6 +1588,50 @@ mod tests {
     fn uid_and_overlay_path_sane() {
         assert!(!uid_string().is_empty());
         assert!(overlay_state_path(Path::new("/tmp")).ends_with("state.json"));
+    }
+
+    #[test]
+    fn history_bounds_come_from_merged_config() {
+        use crate::config::{Env, load_from_env};
+        use crate::paths::Paths;
+        let tmp = tempfile::tempdir().unwrap();
+        // Config-file values (not process env) must drive prune bounds.
+        let mut env = Env::with_vars([
+            ("DICTATE_HISTORY_DAYS".into(), "7".into()),
+            ("DICTATE_HISTORY_MAX".into(), "11".into()),
+        ]);
+        env.xdg_config_home = Some(tmp.path().to_string_lossy().into_owned());
+        env.home = Some(tmp.path().to_string_lossy().into_owned());
+        let cfg = load_from_env(&env).unwrap();
+        let paths = Paths {
+            rundir: tmp.path().into(),
+            datadir: tmp.path().join("d"),
+            state_dir: tmp.path().join("s"),
+            history_dir: tmp.path().join("h"),
+            history_enabled: true,
+            pidfile: tmp.path().join("p"),
+            startfile: tmp.path().join("st"),
+            wav: tmp.path().join("w"),
+            wav_proc: tmp.path().join("wp"),
+            raw: tmp.path().join("r"),
+            log: tmp.path().join("l"),
+            release_timing: tmp.path().join("rt"),
+            preview_timing: tmp.path().join("pt"),
+            preview_pidfile: tmp.path().join("pp"),
+            modefile: tmp.path().join("m"),
+        };
+        let ctx = Ctx::new(cfg, paths, true).unwrap();
+        assert_eq!(ctx.history.max_days, 7);
+        assert_eq!(ctx.history.max_entries, 11);
+        // Unusable storage degrades to disabled, never fatal.
+        let empty = crate::config::Env::default();
+        let ctx2 = Ctx::new(
+            load_from_env(&empty).unwrap(),
+            Paths::resolve(&empty).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(!ctx2.history.enabled);
     }
 }
 

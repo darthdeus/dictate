@@ -139,8 +139,15 @@ is isolated behind traits (`audio`, `overlay`, `delivery`, `transcribe`) for
 a native phase 2. The overlay JSON protocol is unchanged, so the current
 GTK renderer keeps working.
 
+Differences from `bin/dictate` (all under `DICTATE_OSD_BACKEND=feh` are
+bash-only):
+
+- Overlay: GTK only. With `DICTATE_OSD_BACKEND=feh` text is still delivered
+  and `state.json` still published, but no panel is spawned; `doctor`
+  reports the setting as a warning, not a requirement for `feh`/`magick`.
+
 ```sh
-cargo test   # 58 unit tests (config, gates, delivery, timing, history)
+cargo test   # 66 unit tests (config, gates, delivery, timing, history)
 cargo clippy # must stay warning-free
 ```
 

@@ -1,13 +1,10 @@
-//! dictate — Rust port (strangler phase).
+//! dictate — native implementation sharing `bin/dictate`'s state directories,
+//! config keys, overlay protocol, and history/timing formats.
 //!
-//! Phase 1: native core (config, text, history, timings, state) + process
-//! calls to external backends (ffmpeg, whisper, xdotool). The legacy
-//! `bin/dictate` bash script remains the reference implementation until each
-//! command is verified against it.
-//!
-//! Platform seam: Linux/X11 specifics live behind traits in
-//! `audio`, `overlay`, and `delivery` so Wayland/macOS can be added later
-//! without touching core.
+//! External backends (`pw-record`/`ffmpeg`, `whisper-cli`/`whisper-server`,
+//! `xdotool`, `xclip`/`copyq`) are invoked as subprocesses. Linux/X11
+//! specifics live behind traits in `audio`, `overlay`, `delivery`, and
+//! `transcribe` so other platforms can be added without touching core.
 
 pub mod audio;
 pub mod config;
@@ -22,3 +19,9 @@ pub mod state;
 pub mod text;
 pub mod timings;
 pub mod transcribe;
+
+/// Serializes tests that write + execute fake helper scripts. Under parallel
+/// load, back-to-back script exec in this environment flakes intermittently
+/// (stale exec/spawn failures); pure-logic tests stay parallel.
+#[cfg(test)]
+pub(crate) static FAKE_EXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

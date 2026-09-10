@@ -42,7 +42,14 @@ impl EnergyGate {
         })
     }
 
-    /// Scan `data` (full file bytes read so far) for new above-threshold
+    /// Drop voice/settle state (file truncation: the recorder restarted
+    /// under us, so a pending settle must not fire on the new file).
+    pub fn reset(&mut self) {
+        self.last_voice = None;
+        self.pending_settle = false;
+    }
+
+    /// Scan `data` (newly recorded samples) for above-threshold energy in
     /// 20ms blocks on the selected channel. Pure function for testability;
     /// IO (read/tail file) stays in the caller.
     pub fn scan(&mut self, data: &[i16], now: f64) -> bool {

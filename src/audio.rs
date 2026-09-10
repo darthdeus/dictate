@@ -94,9 +94,10 @@ impl ProcessAudio {
         }
     }
 
-    /// Argv for channel extraction to 16k mono (without spawn — testable).
+    /// Argv for channel extraction from a headerless raw capture to 16k mono
+    /// (without spawn — testable). Only for `dictate-raw.pcm` and its
+    /// preview snaps; WAV files must use [`Self::wav_mono16_command`].
     pub fn mono16_command(&self, src: &Path, dest: &Path, chan: u32, channels: u32) -> (String, Vec<String>) {
-        let _ = channels;
         (
             self.ffmpeg_bin.clone(),
             vec![
@@ -109,6 +110,32 @@ impl ProcessAudio {
                 "-c:a".into(), "pcm_s16le".into(), "-y".into(), dest.display().to_string(),
             ],
         )
+    }
+
+    /// Argv for channel extraction from a WAV file to 16k mono (container
+    /// autodetection, like bash `to_mono16`). For `cap_secs` outputs
+    /// (`level`/`scan`), which are WAV regardless of backend.
+    pub fn wav_mono16_command(&self, src: &Path, dest: &Path, chan: u32) -> (String, Vec<String>) {
+        (
+            self.ffmpeg_bin.clone(),
+            vec![
+                "-nostdin".into(), "-hide_banner".into(), "-loglevel".into(), "error".into(),
+                "-i".into(), src.display().to_string(),
+                "-af".into(), format!("pan=mono|c0=c{chan}"),
+                "-ar".into(), "16000".into(), "-ac".into(), "1".into(),
+                "-c:a".into(), "pcm_s16le".into(), "-y".into(), dest.display().to_string(),
+            ],
+        )
+    }
+
+    /// Run WAV channel extraction (see [`Self::wav_mono16_command`]).
+    pub fn wav_to_mono16(&self, src: &Path, dest: &Path, chan: u32) -> Result<()> {
+        let (prog, args) = self.wav_mono16_command(src, dest, chan);
+        let status = std::process::Command::new(prog).args(args).status()?;
+        if !status.success() {
+            anyhow::bail!("dictate: could not extract channel {chan}");
+        }
+        Ok(())
     }
 
     /// Run channel extraction with an explicit channel count (pipeline use;
@@ -132,6 +159,13 @@ impl ProcessAudio {
         let stderr = String::from_utf8_lossy(&out.stderr);
         parse_volumedetect_peak(&stderr)
     }
+}
+
+/// True when a `timeout`-bounded capture succeeded. GNU `timeout` exits 124
+/// when the timer expires — the recording itself is complete (bash `cap_secs`
+/// relies on this with `|| true`).
+pub fn bounded_capture_ok(status: std::process::ExitStatus) -> bool {
+    status.success() || status.code() == Some(124)
 }
 
 /// Parse `max_volume: -12.3 dB` (or `-inf dB`) from ffmpeg stderr.
@@ -276,6 +310,29 @@ mod tests {
         let af = args.windows(2).find(|w| w[0] == "-af").unwrap()[1].clone();
         assert_eq!(af, "pan=mono|c0=c6");
         assert!(args.windows(2).any(|w| w[0] == "-ar" && w[1] == "16000"));
+        // Raw path declares its headerless format explicitly.
+        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "s16le"));
+    }
+
+    #[test]
+    fn wav_mono16_autodetects_container() {
+        let a = proc_audio();
+        let (_, args) = a.wav_mono16_command(Path::new("in.wav"), Path::new("o.wav"), 2);
+        // No `-f` before `-i`: a WAV header must be parsed, not overridden.
+        let ipos = args.iter().position(|a| a == "-i").unwrap();
+        assert!(!args[..ipos].iter().any(|a| a == "-f"));
+        let af = args.windows(2).find(|w| w[0] == "-af").unwrap()[1].clone();
+        assert_eq!(af, "pan=mono|c0=c2");
+    }
+
+    #[test]
+    fn timeout_124_is_successful_bounded_capture() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(bounded_capture_ok(std::process::ExitStatus::from_raw(0)));
+        // GNU timeout exits 124 when the timer expires: the capture itself
+        // succeeded (bash `cap_secs` ignores it with `|| true`).
+        assert!(bounded_capture_ok(std::process::ExitStatus::from_raw(124 << 8)));
+        assert!(!bounded_capture_ok(std::process::ExitStatus::from_raw(1 << 8)));
     }
 
     #[test]

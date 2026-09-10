@@ -140,7 +140,12 @@ impl ProcessClipboard {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .context("dictate: clipboard set failed")?;
-            child.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
+            match child.stdin.as_mut() {
+                Some(stdin) => {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                None => anyhow::bail!("dictate: clipboard set failed"),
+            }
             child.wait()?;
         }
         Ok(())
@@ -177,7 +182,10 @@ impl Xdotool {
 
     /// One X client owns the whole chord incl. clearmodifiers (bash
     /// `send_paste_key` — never split modifier down/key/up across clients).
-    pub fn send_paste(&self, chord: &str, delay_secs: &str, log: &Path) -> Result<()> {
+    /// On success appends `paste_shortcut_sent` to the release-timing TSV
+    /// (bash `release_mark`); `timing` is `None` outside `stop` (e.g. retry),
+    /// where no TSV is active.
+    pub fn send_paste(&self, chord: &str, delay_secs: &str, timing: Option<&Path>) -> Result<()> {
         let ms = paste_delay_ms(delay_secs).to_string();
         let status = std::process::Command::new(&self.bin)
             .args(["key", "--clearmodifiers", "--delay", &ms, chord])
@@ -186,7 +194,9 @@ impl Xdotool {
         if !status.success() {
             anyhow::bail!("dictate: paste shortcut failed");
         }
-        append_line(log, "paste_shortcut_sent marker (see timings)");
+        if let Some(tsv) = timing {
+            append_timing(tsv, "paste_shortcut_sent");
+        }
         Ok(())
     }
 
@@ -202,11 +212,93 @@ impl Xdotool {
     }
 }
 
-fn append_line(path: &Path, line: &str) {
+fn append_timing(tsv: &Path, event: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(tsv) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let _ = writeln!(f, "{event}\t{now:.6}");
     }
+}
+
+/// Schedule clipboard restoration in a detached re-execution of this binary
+/// (`restore-clipboard` subcommand).
+///
+/// Bash restores from a background subshell that outlives the script; a
+/// `std::thread::spawn` here would die with `stop` before the settle delay
+/// elapsed, so the default `DICTATE_CLIPBOARD=restore` never restored.
+/// The child is spawned detached (stdio null, handle dropped) and survives
+/// our exit via reparenting. Payloads travel in 0600 files, never argv.
+pub fn schedule_detached_restore(
+    datadir: &Path,
+    exe: &Path,
+    clip: &ProcessClipboard,
+    our_text: &str,
+    prev: &str,
+    settle_secs: f64,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let base = format!("dictate-restore-{}-{n}", std::process::id());
+    let expected_path = datadir.join(format!(".{base}.expected"));
+    let prev_path = datadir.join(format!(".{base}.prev"));
+    for (path, text) in [(&expected_path, our_text), (&prev_path, prev)] {
+        std::fs::write(path, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let spawn = std::process::Command::new(exe)
+        .args([
+            "restore-clipboard",
+            clip.backend(),
+            &settle_secs.max(0.0).to_string(),
+            &expected_path.display().to_string(),
+            &prev_path.display().to_string(),
+            &clip.xclip_bin,
+            &clip.copyq_bin,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if spawn.is_err() {
+        let _ = std::fs::remove_file(&expected_path);
+        let _ = std::fs::remove_file(&prev_path);
+        anyhow::bail!("dictate: clipboard restore unavailable");
+    }
+    Ok(())
+}
+
+/// Hidden `restore-clipboard` worker: sleep, then restore `prev` only while
+/// the clipboard still holds our dictation (a newer user copy must win).
+/// Always removes its payload files.
+pub fn run_restore_worker(
+    backend: &str,
+    settle_secs: f64,
+    expected_path: &Path,
+    prev_path: &Path,
+    xclip_bin: &str,
+    copyq_bin: &str,
+) {
+    std::thread::sleep(std::time::Duration::from_secs_f64(settle_secs.max(0.0)));
+    let expected = std::fs::read_to_string(expected_path).unwrap_or_default();
+    let prev = std::fs::read_to_string(prev_path).unwrap_or_default();
+    let clip = ProcessClipboard {
+        xclip_bin: xclip_bin.to_string(),
+        copyq_bin: copyq_bin.to_string(),
+        force_backend: Some(backend.to_string()),
+    };
+    if !expected.is_empty() && should_restore_clipboard(&clip.get(), &expected) {
+        let _ = clip.set(&prev);
+    }
+    let _ = std::fs::remove_file(expected_path);
+    let _ = std::fs::remove_file(prev_path);
 }
 
 #[cfg(test)]
@@ -284,5 +376,49 @@ mod tests {
     fn restore_guard_preserves_newer_user_copy() {
         assert!(should_restore_clipboard("our text", "our text"));
         assert!(!should_restore_clipboard("user copied this", "our text"));
+    }
+
+    #[test]
+    fn detached_restore_spawn_failure_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clip = ProcessClipboard::new();
+        let err = schedule_detached_restore(
+            tmp.path(),
+            std::path::Path::new("/nonexistent/dictate"),
+            &clip,
+            "our text", "prev text", 0.4,
+        );
+        assert!(err.is_err());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_worker_conditional_restore() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("clip");
+        std::fs::write(&state, "our text").unwrap();
+        // Fake xclip: `-o` prints state, otherwise stdin becomes state.
+        let fake = tmp.path().join("xclip");
+        std::fs::write(&fake, format!(
+            "#!/bin/sh\nif [ \"$3\" = \"-o\" ]; then cat \"{}\"; else cat > \"{}\"; fi\n",
+            state.display(), state.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = fake.to_string_lossy().into_owned();
+        let expected = tmp.path().join("exp");
+        let prev = tmp.path().join("prv");
+        std::fs::write(&expected, "our text").unwrap();
+        std::fs::write(&prev, "prev text").unwrap();
+        run_restore_worker("xclip", 0.0, &expected, &prev, &fake, "copyq");
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "prev text");
+        assert!(!expected.exists() && !prev.exists(), "payload files removed");
+        // Newer user copy wins.
+        std::fs::write(&state, "user copied this").unwrap();
+        std::fs::write(&expected, "our text").unwrap();
+        std::fs::write(&prev, "prev text").unwrap();
+        run_restore_worker("xclip", 0.0, &expected, &prev, &fake, "copyq");
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "user copied this");
     }
 }

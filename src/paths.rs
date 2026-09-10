@@ -10,6 +10,23 @@ use std::path::PathBuf;
 
 use crate::config::Env;
 
+/// Process-wide `umask 077`, mirroring `umask 077` at the top of
+/// `bin/dictate` / `bin/dictate-overlay`: every file created afterwards
+/// (pidfiles, state.json, history payloads, restore temp files) is
+/// owner-only even where an explicit chmod was forgotten. Call once at
+/// process start, before any file creation.
+pub fn set_private_umask() {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        unsafe {
+            umask(0o077);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub rundir: PathBuf,

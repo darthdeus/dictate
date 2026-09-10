@@ -123,11 +123,14 @@ pub fn whisper_cli_args(cfg: &WhisperConfig, wav: &Path) -> Vec<String> {
 }
 
 /// Full whisper path: server first, CLI fallback on any failure.
-/// `log: &Path` receives the same `note: ...` lines bash appends to `$LOG`.
+/// `log: &Path` receives the same `note: ...` lines bash appends to `$LOG`,
+/// plus backend stderr (bash `2>>"$LOG"` on every backend call, so a
+/// "transcription failed" always has its backend message in the log).
 pub fn transcribe_whisper(wav: &Path, cfg: &WhisperConfig, log: &Path) -> Result<String> {
     if !cfg.server.is_empty() {
         let args = curl_inference_args(&cfg.server, wav, &cfg.language, &cfg.prompt);
         if let Ok(out) = std::process::Command::new(&cfg.curl_bin).args(&args).output() {
+            append_bytes(log, &out.stderr);
             if out.status.success() {
                 let body = String::from_utf8_lossy(&out.stdout);
                 if let Ok(text) = parse_inference_text(&body) {
@@ -142,13 +145,14 @@ pub fn transcribe_whisper(wav: &Path, cfg: &WhisperConfig, log: &Path) -> Result
         .args(&args)
         .output()
         .with_context(|| format!("dictate: cannot run {}", cfg.whisper_bin))?;
+    append_bytes(log, &out.stderr);
     if !out.status.success() {
         anyhow::bail!("dictate: transcription failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn transcribe_parakeet(wav: &Path, cfg: &ParakeetConfig) -> Result<String> {
+pub fn transcribe_parakeet(wav: &Path, cfg: &ParakeetConfig, log: &Path) -> Result<String> {
     let out = std::process::Command::new(&cfg.bin)
         .args([
             "-m", &cfg.model,
@@ -157,10 +161,24 @@ pub fn transcribe_parakeet(wav: &Path, cfg: &ParakeetConfig) -> Result<String> {
         ])
         .output()
         .with_context(|| format!("dictate: cannot run {}", cfg.bin))?;
+    append_bytes(log, &out.stderr);
     if !out.status.success() {
         anyhow::bail!("dictate: transcription failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(bytes);
+        if !bytes.ends_with(b"\n") {
+            let _ = writeln!(f);
+        }
+    }
 }
 
 fn append_line(path: &Path, line: &str) {
@@ -214,6 +232,7 @@ mod tests {
 
     #[test]
     fn server_success_used_and_cli_skipped() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let curl = fake_bin(tmp.path(), "curl", "#!/bin/sh\necho '{\"text\":\"recognized text\"}'\n");
         let cli = fake_bin(tmp.path(), "whisper-cli", "#!/bin/sh\necho CLI-SHOULD-NOT-RUN; exit 3\n");
@@ -227,6 +246,7 @@ mod tests {
 
     #[test]
     fn bad_server_response_falls_back_to_cli() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let curl = fake_bin(tmp.path(), "curl", "#!/bin/sh\necho '{\"error\":1}'\n");
         let cli = fake_bin(tmp.path(), "whisper-cli", "#!/bin/sh\necho fallback-text\n");
@@ -241,6 +261,7 @@ mod tests {
 
     #[test]
     fn unreachable_server_falls_back_to_cli() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let curl = fake_bin(tmp.path(), "curl", "#!/bin/sh\nexit 7\n");
         let cli = fake_bin(tmp.path(), "whisper-cli", "#!/bin/sh\necho cli-text\n");
@@ -253,6 +274,7 @@ mod tests {
 
     #[test]
     fn empty_server_forces_cli() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let curl = fake_bin(tmp.path(), "curl", "#!/bin/sh\necho SHOULD-NOT-RUN; exit 0\n");
         let cli = fake_bin(tmp.path(), "whisper-cli", "#!/bin/sh\necho direct\n");

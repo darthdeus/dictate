@@ -127,24 +127,48 @@ fn replace_sentence_periods(text: &str) -> String {
     }
 }
 
-/// Normalize for noise matching: lowercase, strip punctuation, collapse spaces.
+/// Normalize for noise matching: lowercase, *delete* ASCII punctuation,
+/// collapse spaces. Deletion (not space replacement) mirrors
+/// `tr -d '[:punct:]'`, so `Amara.org` becomes `amaraorg` and still matches
+/// the stock-hallucination blocklist.
 pub fn normalize_noise(text: &str) -> String {
     text.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .filter(|c| !c.is_ascii_punctuation())
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// True when the transcript is empty or exactly one stock hallucination.
+/// True when the transcript is empty or whole-string matches the noise
+/// blocklist. `DICTATE_NOISE` is an ERE (bash `grep -qxE`), so matching goes
+/// through `grep` itself; only when `grep` is unavailable do we fall back to
+/// exact-alternative comparison.
 pub fn is_noise(text: &str, blocklist_ere: &str) -> bool {
     let norm = normalize_noise(text);
     if norm.is_empty() {
         return true;
     }
-    blocklist_ere.split('|').any(|p| p.trim() == norm)
+    match grep_whole_match(&norm, blocklist_ere) {
+        Some(matched) => matched,
+        None => blocklist_ere.split('|').any(|p| p.trim() == norm),
+    }
+}
+
+fn grep_whole_match(line: &str, ere: &str) -> Option<bool> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("grep")
+        .args(["-qxE", "--", ere])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(line.as_bytes()).ok()?;
+    child.stdin.as_mut()?.write_all(b"\n").ok()?;
+    drop(child.stdin.take());
+    Some(child.wait().ok()?.success())
 }
 
 /// Collapse whisper whitespace/bracket cleanup done in `stop()`:
@@ -212,6 +236,25 @@ mod tests {
         assert!(is_noise("  so  ", DEFAULT_NOISE_PHRASES));
         assert!(!is_noise("So this is a real sentence", DEFAULT_NOISE_PHRASES));
         assert!(!is_noise("Okay, here is my dictation", DEFAULT_NOISE_PHRASES));
+    }
+
+    #[test]
+    fn noise_deletes_punctuation_like_tr() {
+        // `tr -d '[:punct:]'` turns `Amara.org` into `amaraorg`.
+        assert_eq!(normalize_noise("Subtitles by the Amara.org community!"), "subtitles by the amaraorg community");
+        assert!(is_noise("Subtitles by the Amara.org community.", DEFAULT_NOISE_PHRASES));
+        assert!(is_noise("Amara.org", "amaraorg"));
+    }
+
+    #[test]
+    fn noise_honors_ere_when_grep_exists() {
+        if !crate::doctor::lookup_in_path("grep") {
+            return;
+        }
+        assert!(is_noise("foobar", "foo.*"));
+        assert!(!is_noise("baz", "foo.*"));
+        // Transcript metacharacters are literal subjects, not patterns.
+        assert!(!is_noise("a+b", "a"));
     }
 
     #[test]

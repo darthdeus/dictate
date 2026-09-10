@@ -71,20 +71,44 @@ enum Command {
     /// Hidden: live-preview scheduler (spawned by `start`)
     #[command(hide = true)]
     PreviewWorker,
+    /// Hidden: clipboard restore worker (spawned detached by `stop`/`retry`)
+    #[command(hide = true)]
+    RestoreClipboard {
+        backend: String,
+        settle_secs: f64,
+        expected_path: String,
+        prev_path: String,
+        xclip_bin: String,
+        copyq_bin: String,
+    },
 }
 
 fn ctx() -> anyhow::Result<pipeline::Ctx> {
     let env = config::Env::from_process();
     let cfg = config::load_from_env(&env)?;
     let paths = Paths::resolve(&cfg.as_env(&env))?;
-    paths.ensure_private_dirs()?;
-    pipeline::Ctx::new(cfg, paths)
+    // A history dir that cannot be created degrades history to disabled
+    // (bash `HISTORY_READY=0`); dictation itself must still work.
+    let history_ready = paths.ensure_private_dirs()?;
+    pipeline::Ctx::new(cfg, paths, history_ready)
 }
 
 fn main() -> anyhow::Result<()> {
+    dictate_lib::paths::set_private_umask();
     let cli = Cli::parse();
     match cli.command {
         Command::PreviewWorker => return pipeline::run_preview_worker(&ctx()?),
+        Command::RestoreClipboard { backend, settle_secs, expected_path, prev_path, xclip_bin, copyq_bin } => {
+            dictate_lib::delivery::run_restore_worker(
+                &backend,
+                settle_secs,
+                std::path::Path::new(&expected_path),
+                std::path::Path::new(&prev_path),
+                &xclip_bin,
+                &copyq_bin,
+            );
+            return Ok(());
+        }
         Command::Start { mode } => {
             let c = ctx()?;
             pipeline::cmd_start(&c, mode.as_deref() == Some("llm"))?;

@@ -1,11 +1,10 @@
-//! Overlay protocol + future native renderer.
+//! Overlay protocol: atomically published `state.json` messages
+//! (`{phase,label,text,audio,channels,channel,duration,expires}`) consumed
+//! by the GTK renderer (`overlay.py`), plus the changed-word ranges and
+//! preview-continuity rules the renderer implements.
 //!
-//! Phase 1 keeps the wire protocol: `bin/dictate` atomically writes
-//! `$RUNDIR/dictate-overlay-$UID/state.json`
-//! (`{phase,label,text,audio,channels,channel,duration,expires}`) and the
-//! existing Python/GTK renderer (`overlay.py`) displays it. Rust owns the
-//! *writer* now; the renderer moves to `winit`/`gtk-rs` in phase 2.
-//! Ports `notify()`, `next_state`, `changed_words` semantics.
+//! Only the GTK backend is implemented; `DICTATE_OSD_BACKEND=feh` stays
+//! bash-only (see README port notes).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -47,15 +46,46 @@ impl OverlayBackend for JsonFileOverlay {
     fn show(&self, msg: &OverlayMessage) -> Result<()> {
         if let Some(parent) = self.state_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Transcripts are sensitive: the state dir must be 0700 *before*
+            // writing (bash `mkdir -p + chmod 700`), not just when the
+            // renderer happens to start. Pre-existing dirs keep their mode
+            // otherwise, which would leak on a shared /tmp fallback.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
-        let tmp = self.state_path.with_extension("json.tmp");
+        // Unique temp file per publish (bash `mktemp state.XXXXXX`): the
+        // preview worker and `stop` write concurrently and must never share
+        // — or tear/swap — one fixed tmp path.
+        let tmp = unique_sibling(&self.state_path)?;
         std::fs::write(&tmp, serde_json::to_string(msg)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
         std::fs::rename(&tmp, &self.state_path)?;
         Ok(())
     }
     fn demo(&self) -> Result<()> {
-        anyhow::bail!("demo not yet ported — using legacy bin/dictate")
+        anyhow::bail!("demo via pipeline::cmd_demo (overlay writer has no demo sequence)")
     }
+}
+
+/// Unique sibling tmp path in the same directory (same filesystem, so the
+/// rename onto `state.json` stays atomic).
+fn unique_sibling(state_path: &Path) -> Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!(".state-{}-{n}-{nanos}.tmp", std::process::id())))
 }
 
 /// Port of the `notify()` title dispatch in `bin/dictate`.
@@ -180,8 +210,6 @@ pub fn keep_preview_on_empty_processing(previous: &str, incoming_text: &str) -> 
     }
 }
 
-pub fn _unused_path_hook(_p: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +258,30 @@ mod tests {
         assert_eq!((p, l.as_str(), t.as_str()), (Phase::Success, "Ready", "final text"));
         let (_, _, t) = map_notify("final text", "extra body");
         assert_eq!(t, "final text\nextra body");
+    }
+
+    #[test]
+    fn show_publishes_atomically_with_private_perms() {
+        use super::{JsonFileOverlay, OverlayBackend, OverlayMessage, Phase};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dictate-overlay-999");
+        let writer = JsonFileOverlay { state_path: dir.join("state.json") };
+        let msg = OverlayMessage {
+            phase: Phase::Recording, label: "Listening".into(), text: "hello".into(),
+            audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
+            duration: 300.0, expires: 1700000300.0,
+        };
+        writer.show(&msg).unwrap();
+        writer.show(&msg).unwrap();
+        let body = std::fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(body.contains("\"hello\""), "{body}");
+        // No fixed tmp path remains (concurrent writers must not share one).
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(dir.join("state.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 }
