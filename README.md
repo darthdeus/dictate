@@ -125,6 +125,25 @@ These checks do not replace a real dictation smoke test in the target
 applications. See [`lib/dictate-overlay/README.md`](lib/dictate-overlay/README.md)
 for overlay, preview, timing, and delivery details.
 
+## Rust port (`src/`)
+
+A native port lives alongside the reference Bash implementation. Same
+subcommands (`cargo run -- <start|stop|toggle|demo|timings|doctor|level|
+meter|serve|scan|bench|history|show|retry>`), same config precedence, same
+history/timing file formats — both binaries read the same state directories,
+so they interoperate entry by entry.
+
+Phase 1 shells out to the same backends (`pw-record`/`ffmpeg`,
+`whisper-cli`/`whisper-server`, `xdotool`, `xclip`/`copyq`); platform code
+is isolated behind traits (`audio`, `overlay`, `delivery`, `transcribe`) for
+a native phase 2. The overlay JSON protocol is unchanged, so the current
+GTK renderer keeps working.
+
+```sh
+cargo test   # 58 unit tests (config, gates, delivery, timing, history)
+cargo clippy # must stay warning-free
+```
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).

@@ -1,0 +1,25 @@
+[package]
+name = "dictate"
+version = "0.1.0"
+edition = "2021"
+description = "Hold-to-talk speech-to-text — local Whisper transcription with click-through overlay"
+license = "MIT"
+
+[[bin]]
+name = "dictate"
+path = "src/main.rs"
+
+[lib]
+name = "dictate_lib"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

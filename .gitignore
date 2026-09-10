@@ -19,3 +19,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+
+# Rust build output (new port lives in src/, target/ is regenerable).
+/target/
