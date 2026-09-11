@@ -129,9 +129,13 @@ impl ProcessAudio {
     }
 
     /// Run WAV channel extraction (see [`Self::wav_mono16_command`]).
-    pub fn wav_to_mono16(&self, src: &Path, dest: &Path, chan: u32) -> Result<()> {
+    /// ffmpeg stderr goes to `log` (bash `to_mono16 ... 2>>"$LOG"`).
+    pub fn wav_to_mono16(&self, src: &Path, dest: &Path, chan: u32, log: &Path) -> Result<()> {
         let (prog, args) = self.wav_mono16_command(src, dest, chan);
-        let status = std::process::Command::new(prog).args(args).status()?;
+        let status = std::process::Command::new(prog)
+            .args(args)
+            .stderr(log_append(log))
+            .status()?;
         if !status.success() {
             anyhow::bail!("dictate: could not extract channel {chan}");
         }
@@ -140,9 +144,20 @@ impl ProcessAudio {
 
     /// Run channel extraction with an explicit channel count (pipeline use;
     /// `to_mono16` reads the count from the environment instead).
-    pub fn mono16_with_channels(&self, src: &Path, dest: &Path, chan: u32, channels: u32) -> Result<()> {
+    /// ffmpeg stderr goes to `log` (bash `raw_to_mono16 ... 2>>"$LOG"`).
+    pub fn mono16_with_channels(
+        &self,
+        src: &Path,
+        dest: &Path,
+        chan: u32,
+        channels: u32,
+        log: &Path,
+    ) -> Result<()> {
         let (prog, args) = self.mono16_command(src, dest, chan, channels);
-        let status = std::process::Command::new(prog).args(args).status()?;
+        let status = std::process::Command::new(prog)
+            .args(args)
+            .stderr(log_append(log))
+            .status()?;
         if !status.success() {
             anyhow::bail!("dictate: could not extract channel {chan}");
         }
@@ -166,6 +181,17 @@ impl ProcessAudio {
 /// relies on this with `|| true`).
 pub fn bounded_capture_ok(status: std::process::ExitStatus) -> bool {
     status.success() || status.code() == Some(124)
+}
+
+/// Append-mode file handle for `log`, or null when the log is unavailable.
+/// Never panics: failure to open the log must not fail the capture itself.
+fn log_append(log: &Path) -> std::process::Stdio {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null())
 }
 
 /// Parse `max_volume: -12.3 dB` (or `-inf dB`) from ffmpeg stderr.
@@ -241,7 +267,10 @@ impl AudioBackend for ProcessAudio {
     fn to_mono16(&self, src: &Path, dest: &Path, chan: u32) -> Result<()> {
         let channels = self.channels_hint();
         let (prog, args) = self.mono16_command(src, dest, chan, channels);
-        let status = std::process::Command::new(prog).args(args).status()?;
+        let status = std::process::Command::new(prog)
+            .args(args)
+            .stderr(log_append(&log_path()))
+            .status()?;
         if !status.success() {
             anyhow::bail!("dictate: could not extract channel {chan}");
         }

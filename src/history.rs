@@ -81,7 +81,9 @@ impl HistoryStore {
 
     fn read_opt(path: &Path) -> String {
         fs::read_to_string(path).unwrap_or_else(|_| "unknown".into())
-    }    /// `history [n]` table. Matches bash column layout.
+    }
+
+    /// `history [n]` table. Matches bash column layout.
     pub fn list(&self, limit: usize) -> Result<String> {
         let mut out = String::new();
         for (n, entry) in self.entries()?.into_iter().enumerate() {
@@ -306,7 +308,10 @@ fn local_stamp() -> String {
         .unwrap_or_else(chrono_stamp)
 }
 
-fn local_iso_now() -> String {
+/// Local `date --iso-8601=seconds` (bash `date` parity), UTC fallback.
+/// Shared by history details and the recording start marker so `started=`
+/// and `saved=` never disagree on zone.
+pub fn local_iso_now() -> String {
     std::process::Command::new("date")
         .arg("--iso-8601=seconds")
         .output()

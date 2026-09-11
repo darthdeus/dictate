@@ -321,7 +321,7 @@ pub fn cmd_start(ctx: &Ctx, llm_mode: bool) -> Result<()> {
         anyhow::bail!("dictate: cannot preserve previous capture");
     }
     let _ = std::fs::remove_file(&ctx.paths.raw);
-    std::fs::write(&ctx.paths.startfile, iso_now())?;
+    std::fs::write(&ctx.paths.startfile, crate::history::local_iso_now())?;
     let rec_pid = ctx.audio().start_capture(
         &ctx.paths.raw,
         RawFormat { channels: ctx.channels(), rate: 48000 },
@@ -362,7 +362,7 @@ fn recover_abandoned(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let recovered = ctx.paths.datadir.join(format!("dictate-recovered-{}.wav", std::process::id()));
-    let converted = ctx.audio().mono16_with_channels(&ctx.paths.raw, &recovered, ctx.chan(), ctx.channels()).is_ok()
+    let converted = ctx.audio().mono16_with_channels(&ctx.paths.raw, &recovered, ctx.chan(), ctx.channels(), &ctx.log).is_ok()
         && std::fs::metadata(&recovered).map(|m| m.len() > 0).unwrap_or(false);
     // History I/O is best-effort (bash warns and continues with
     // `HISTORY_ENTRY=""`); a history-dir problem must not abort the capture.
@@ -412,25 +412,6 @@ fn recover_abandoned(ctx: &Ctx) -> Result<()> {
 fn file_stamp() -> String {
     let t = now_unix() as i64;
     format!("{t}")
-}
-
-fn iso_now() -> String {
-    // `date --iso-8601=seconds` equivalent in UTC (+00:00 suffix).
-    let secs = now_unix() as i64;
-    let days = secs.div_euclid(86400);
-    let sod = secs.rem_euclid(86400);
-    // Reuse history's civil conversion via a local copy (no dep).
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 }.div_euclid(146097);
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00", m, d, sod / 3600, (sod % 3600) / 60, sod % 60)
 }
 
 /// Liveness only: any HTTP response counts (bash `server_up` — no `-f`,
@@ -512,7 +493,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         notify(ctx, "dictate: no audio captured", "check the mic — dictate doctor", 4000);
         return Ok(());
     }
-    if ctx.audio().mono16_with_channels(&ctx.paths.raw, &ctx.paths.wav, ctx.chan(), ctx.channels()).is_err()
+    if ctx.audio().mono16_with_channels(&ctx.paths.raw, &ctx.paths.wav, ctx.chan(), ctx.channels(), &ctx.log).is_err()
         || std::fs::metadata(&ctx.paths.wav).map(|m| m.len() == 0).unwrap_or(true)
     {
         let mic = ctx.mic();
@@ -542,7 +523,8 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
     }
 
     ctx.mark("audio_prepared");
-    let started = std::fs::read_to_string(&ctx.paths.startfile).unwrap_or_else(|_| iso_now());
+    let started = std::fs::read_to_string(&ctx.paths.startfile)
+        .unwrap_or_else(|_| crate::history::local_iso_now());
     let started = started.trim().to_string();
     // Best-effort like bash: transcription/delivery proceed even when the
     // archive fails; only the entry-gated status updates are skipped.
@@ -1067,7 +1049,7 @@ pub fn cmd_level(ctx: &Ctx, secs: u64) -> Result<()> {
     let raw = ctx.paths.datadir.join("dictate-level-raw.wav");
     let tmp = ctx.paths.datadir.join("dictate-level.wav");
     cap_secs(ctx, &raw, secs, ctx.channels())?;
-    ctx.audio().wav_to_mono16(&raw, &tmp, ctx.chan())?;
+    ctx.audio().wav_to_mono16(&raw, &tmp, ctx.chan(), &ctx.log)?;
     let (peak, rms) = audio::parse_astats_peak_rms(&astats_output(&tmp));
     println!("\n  peak {:>8} dBFS", peak.map(|p| format!("{p:.1}")).unwrap_or_else(|| "?".into()));
     println!("  rms  {:>8} dBFS\n", rms.map(|r| format!("{r:.1}")).unwrap_or_else(|| "?".into()));
@@ -1086,22 +1068,41 @@ pub fn cmd_level(ctx: &Ctx, secs: u64) -> Result<()> {
 /// the configured single channel (bash `CHANNELS="$nch"`).
 fn cap_secs(ctx: &Ctx, dest: &Path, secs: u64, channels: u32) -> Result<()> {
     let audio = ctx.audio();
+    // Recorder output joins the state log (bash `>>"$LOG" 2>&1`).
+    let logfile = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ctx.log)
+            .ok()
+    };
     if audio.use_pw_record() {
         // `timeout -s INT` exits 124 after a successful timed capture;
         // bash `cap_secs` ignores it (`|| true`). Spawn errors still fail.
-        let _ = std::process::Command::new("timeout")
-            .args(["-s", "INT", &secs.to_string(), "pw-record",
+        let mut cmd = std::process::Command::new("timeout");
+        cmd.args(["-s", "INT", &secs.to_string(), "pw-record",
                 "--target", &ctx.mic(), "--rate", "48000",
                 "--channels", &channels.to_string(), "--format", "s16"])
-            .arg(dest).status()?;
+            .arg(dest);
+        if let Some(f) = logfile() {
+            cmd.stdout(std::process::Stdio::from(f));
+        }
+        if let Some(f) = logfile() {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        cmd.status()?;
         Ok(())
     } else {
-        let status = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error",
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error",
                 "-f", "pulse", "-channels", &channels.to_string(),
                 "-i", &ctx.pulse_mic(), "-t", &secs.to_string(),
                 "-c:a", "pcm_s16le", "-y"])
-            .arg(dest).status()?;
+            .arg(dest);
+        if let Some(f) = logfile() {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        let status = cmd.status()?;
         if !audio::bounded_capture_ok(status) {
             anyhow::bail!("dictate: capture failed");
         }
@@ -1448,7 +1449,7 @@ pub fn run_preview_worker(ctx: &Ctx) -> Result<()> {
         let wav = ctx.paths.datadir.join("dictate-preview.wav");
         let t0 = now_unix();
         let prepared_ok = std::fs::copy(&ctx.paths.raw, &snap).is_ok()
-            && ctx.audio().mono16_with_channels(&snap, &wav, ctx.chan(), ctx.channels()).is_ok();
+            && ctx.audio().mono16_with_channels(&snap, &wav, ctx.chan(), ctx.channels(), &ctx.log).is_ok();
         let t1 = now_unix();
         if !prepared_ok {
             let gap = if previous > 0.0 { (t0 - previous) * 1000.0 } else { 0.0 };
@@ -1553,6 +1554,26 @@ fn bytes_to_i16(data: &[u8]) -> Vec<i16> {
     data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
 }
 
+// Test seam for pactl parsing (same scan as `pactl_source_channels`).
+fn pactl_channels_from(mic: &str, text: &str) -> Option<u32> {
+    let mut cur = false;
+    for line in text.lines() {
+        if line.split_whitespace().next() == Some("Name:") {
+            cur = line.contains(mic);
+        }
+        if cur && line.contains("Sample Specification:") {
+            for tok in line.split_whitespace() {
+                if let Some(n) = tok.strip_suffix("ch") {
+                    if let Ok(v) = n.parse() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,24 +1654,4 @@ mod tests {
         .unwrap();
         assert!(!ctx2.history.enabled);
     }
-}
-
-// Test seam for pactl parsing (same scan as `pactl_source_channels`).
-fn pactl_channels_from(mic: &str, text: &str) -> Option<u32> {
-    let mut cur = false;
-    for line in text.lines() {
-        if line.split_whitespace().next() == Some("Name:") {
-            cur = line.contains(mic);
-        }
-        if cur && line.contains("Sample Specification:") {
-            for tok in line.split_whitespace() {
-                if let Some(n) = tok.strip_suffix("ch") {
-                    if let Ok(v) = n.parse() {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-    }
-    None
 }

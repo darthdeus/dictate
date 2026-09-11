@@ -147,8 +147,8 @@ bash-only):
   reports the setting as a warning, not a requirement for `feh`/`magick`.
 
 ```sh
-cargo test   # 66 unit tests (config, gates, delivery, timing, history)
-cargo clippy # must stay warning-free
+cargo test                          # 66 unit tests (config, gates, delivery, timing, history)
+cargo clippy --all-targets -- -D warnings   # must stay warning-free
 ```
 
 ## License

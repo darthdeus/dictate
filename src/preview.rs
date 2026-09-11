@@ -137,9 +137,7 @@ mod tests {
         let mut g = EnergyGate::new(1, 0, -48.0).unwrap();
         assert!(!g.scan(&silence(0.1), 0.0));
         let mut speech = silence(0.02);
-        for v in &mut speech {
-            *v = 1000;
-        }
+        speech.fill(1000);
         assert!(g.scan(&speech, 0.1));
         assert!(!g.scan(&silence(0.02), 0.2));
         assert!(g.scan(&silence(0.02), 0.41));

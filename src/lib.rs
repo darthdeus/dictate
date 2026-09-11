@@ -20,8 +20,8 @@ pub mod text;
 pub mod timings;
 pub mod transcribe;
 
-/// Serializes tests that write + execute fake helper scripts. Under parallel
-/// load, back-to-back script exec in this environment flakes intermittently
-/// (stale exec/spawn failures); pure-logic tests stay parallel.
+/// Serializes tests that shell out to helper binaries (fake-script exec,
+/// `grep -E` matching). Under parallel load, back-to-back exec in this
+/// environment flakes intermittently; pure-logic tests stay parallel.
 #[cfg(test)]
 pub(crate) static FAKE_EXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

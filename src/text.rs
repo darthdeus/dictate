@@ -248,6 +248,7 @@ mod tests {
 
     #[test]
     fn noise_honors_ere_when_grep_exists() {
+        let _exec_guard = crate::FAKE_EXEC_LOCK.lock().unwrap();
         if !crate::doctor::lookup_in_path("grep") {
             return;
         }
