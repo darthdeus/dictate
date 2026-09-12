@@ -68,6 +68,11 @@ enum Command {
         /// Entry id or prefix (default: latest with transcript)
         id: Option<String>,
     },
+    /// Re-transcribe saved dictations and compare with their saved transcripts
+    Replay {
+        #[arg(default_value = "20")]
+        n: usize,
+    },
     /// Hidden: live-preview scheduler (spawned by `start`)
     #[command(hide = true)]
     PreviewWorker,
@@ -151,6 +156,10 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Retry { id } => {
             pipeline::cmd_retry(&ctx()?, id.as_deref())?;
+        }
+        Command::Replay { n } => {
+            let code = pipeline::cmd_replay(&ctx()?, n)?;
+            std::process::exit(code);
         }
         Command::Timings { kind } => {
             let c = ctx()?;

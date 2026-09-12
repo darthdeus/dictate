@@ -121,8 +121,8 @@ bin/dictate-overlay --check-delivery
 bash -n bin/dictate bin/dictate-overlay
 ```
 
-These checks do not replace a real dictation smoke test in the target
-applications. See [`lib/dictate-overlay/README.md`](lib/dictate-overlay/README.md)
+These checks do not replace a real dictation [smoke test](docs/smoke-test.md)
+in the target applications. See [`lib/dictate-overlay/README.md`](lib/dictate-overlay/README.md)
 for overlay, preview, timing, and delivery details.
 
 ## Rust port (`src/`)
@@ -132,6 +132,15 @@ subcommands (`cargo run -- <start|stop|toggle|demo|timings|doctor|level|
 meter|serve|scan|bench|history|show|retry>`), same config precedence, same
 history/timing file formats — both binaries read the same state directories,
 so they interoperate entry by entry.
+
+The port adds `dictate replay [n]`: the newest `n` saved recordings go back
+through the same audio → text path as `stop` (read-only — no history writes,
+overlay, or delivery) and are compared with the transcripts saved at the
+time. On unchanged configuration every entry should be identical, which makes
+it an end-to-end regression check against your own history, including
+entries recorded by `bin/dictate`. It needs the transcription server (or
+`whisper-cli`) and does not exercise capture, preview, or delivery; those are
+covered by the [smoke test](docs/smoke-test.md).
 
 Phase 1 shells out to the same backends (`pw-record`/`ffmpeg`,
 `whisper-cli`/`whisper-server`, `xdotool`, `xclip`/`copyq`); platform code
@@ -147,8 +156,9 @@ bash-only):
   reports the setting as a warning, not a requirement for `feh`/`magick`.
 
 ```sh
-cargo test                          # 66 unit tests (config, gates, delivery, timing, history)
+cargo test                          # unit tests (config, gates, delivery, timing, history, text)
 cargo clippy --all-targets -- -D warnings   # must stay warning-free
+cargo run --release -- replay 50    # end-to-end text path over saved history
 ```
 
 ## License

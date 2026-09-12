@@ -70,7 +70,12 @@ fn lowercase_initials(text: &str, keep: &HashSet<String>) -> String {
             text[..*a].trim_end().chars().last().map(|c| matches!(c, '.' | '?' | '!')).unwrap_or(false)
         };
         if initial {
-            out.push_str(&maybe_lower(word, keep));
+            // The Python word is `[A-Za-z][\w']*`, so trailing punctuation
+            // ("Okay," / "So,") is not part of it and must not block the
+            // lowercase or the glossary lookup.
+            let len = word_prefix_len(word);
+            out.push_str(&maybe_lower(&word[..len], keep));
+            out.push_str(&word[len..]);
         } else {
             out.push_str(word);
         }
@@ -78,6 +83,19 @@ fn lowercase_initials(text: &str, keep: &HashSet<String>) -> String {
     }
     out.push_str(&text[last_end..]);
     out
+}
+
+/// Byte length of the leading `[A-Za-z][\w']*` match; 0 when `word` does
+/// not start with an ASCII letter (Python leaves such words alone).
+fn word_prefix_len(word: &str) -> usize {
+    match word.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => word
+            .char_indices()
+            .find(|&(_, c)| !(c.is_alphanumeric() || c == '_' || c == '\''))
+            .map(|(i, _)| i)
+            .unwrap_or(word.len()),
+        _ => 0,
+    }
 }
 
 fn maybe_lower(word: &str, keep: &HashSet<String>) -> String {
@@ -221,6 +239,18 @@ mod tests {
         assert!(out.contains("SvelteKit"), "{out}");
         assert!(out.contains("NixOS"), "{out}");
         assert!(out.contains('I'), "{out}");
+    }
+
+    #[test]
+    fn initial_word_followed_by_punctuation_is_lowered() {
+        // Found by `dictate replay`: bash lowercased these, Rust did not.
+        assert_eq!(
+            restyle("Okay, this works. So, commit it? Fundamentally, yes.", true, ""),
+            "okay, this works ... so, commit it? fundamentally, yes"
+        );
+        // The glossary lookup sees the bare word too.
+        assert_eq!(restyle("Rock, go.", true, "Rock, Stone"), "Rock, go");
+        assert_eq!(restyle("\"Hello\" there.", true, ""), "\"Hello\" there");
     }
 
     #[test]

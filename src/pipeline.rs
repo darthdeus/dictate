@@ -554,6 +554,59 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
     }
     notify(ctx, "\u{23f3} transcribing\u{2026}", "", 15000);
 
+    let mode = ctx.state.take_mode();
+    let text = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode) {
+        Err(e) => {
+            notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
+            return Err(e);
+        }
+        Ok(TextOutcome::Silence(peak)) => {
+            notify(ctx, "dictate: silence",
+                &format!("peak {} dBFS", peak.map(|p| format!("{p:.1}")).unwrap_or_else(|| "?".into())), 1800);
+            return Ok(());
+        }
+        Ok(TextOutcome::NoSpeech) => {
+            notify(ctx, "dictate: no speech detected", "", 2500);
+            return Ok(());
+        }
+        Ok(TextOutcome::Noise(text)) => {
+            notify(ctx, "dictate: discarded noise", &text, 2000);
+            return Ok(());
+        }
+        Ok(TextOutcome::Ready { text, .. }) => text,
+    };
+
+    if ctx.c("DICTATE_NOTYPE", "0") == "1" {
+        ctx.clipboard().set(&text)?;
+        if let Some(e) = &entry {
+            ctx.history.set_status(e, "copied-to-clipboard");
+        }
+        notify(ctx, &format!("\u{1f4cb} {text}"), "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
+    } else {
+        notify(ctx, &text, "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
+        ctx.mark("overlay_submitted");
+        deliver(ctx, &text);
+        ctx.mark("delivery_returned");
+        if let Some(e) = &entry {
+            ctx.history.set_status(e, "delivery-attempted");
+        }
+    }
+    Ok(())
+}
+
+/// What the audio → text half of `stop` produced for one clip.
+pub enum TextOutcome {
+    Silence(Option<f32>),
+    NoSpeech,
+    Noise(String),
+    Ready { raw: String, text: String },
+}
+
+/// Silence gate, transcription, cleanup, noise blocklist and style for one
+/// mono 16 kHz wav — everything `stop` does between capture and delivery,
+/// shared with `replay`. History statuses and transcripts are written only
+/// when `entry` is given; overlay notices are left to the caller.
+fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -> Result<TextOutcome> {
     let mut whisper = WhisperConfig::new(
         &ctx.server(), &ctx.model(),
         &ctx.c("DICTATE_LANG", "auto"), &ctx.c("DICTATE_PROMPT", ""),
@@ -566,24 +619,22 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         }
     }
 
-    let peak = ctx.audio().measure_peak_db(&ctx.paths.wav);
+    let peak = ctx.audio().measure_peak_db(wav);
     let feed: PathBuf = if ctx.c("DICTATE_FILTER", "").is_empty() {
-        ctx.paths.wav.clone()
-    } else if apply_filter(&ctx.paths.wav, &ctx.paths.wav_proc, &ctx.c("DICTATE_FILTER", ""), &ctx.log) {
+        wav.to_path_buf()
+    } else if apply_filter(wav, &ctx.paths.wav_proc, &ctx.c("DICTATE_FILTER", ""), &ctx.log) {
         ctx.paths.wav_proc.clone()
     } else {
         append_log(&ctx.log, "warning: filter chain failed, feeding raw audio to whisper");
-        ctx.paths.wav.clone()
+        wav.to_path_buf()
     };
 
     let min_peak: f64 = ctx.c("DICTATE_MIN_PEAK", "-45").parse().unwrap_or(-45.0);
     if is_silence(peak, min_peak) {
-        if let Some(e) = &entry {
+        if let Some(e) = entry {
             ctx.history.set_status(e, "silence");
         }
-        notify(ctx, "dictate: silence",
-            &format!("peak {} dBFS", peak.map(|p| format!("{p:.1}")).unwrap_or_else(|| "?".into())), 1800);
-        return Ok(());
+        return Ok(TextOutcome::Silence(peak));
     }
 
     ctx.mark("audio_checked");
@@ -603,26 +654,24 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         Engine::Whisper => transcribe::transcribe_whisper(&feed, &whisper, &ctx.log),
     };
     let Ok(raw_text) = raw_text else {
-        if let Some(e) = &entry {
+        if let Some(e) = entry {
             ctx.history.set_status(e, "transcription-failed");
         }
-        notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
         anyhow::bail!("dictate: transcription failed");
     };
     ctx.mark("transcription_finished");
-    let mut text = text::clean_whisper_text(&raw_text);
-    if text.is_empty() {
-        if let Some(e) = &entry {
+    let raw = text::clean_whisper_text(&raw_text);
+    if raw.is_empty() {
+        if let Some(e) = entry {
             ctx.history.set_status(e, "no-speech");
         }
-        notify(ctx, "dictate: no speech detected", "", 2500);
-        return Ok(());
+        return Ok(TextOutcome::NoSpeech);
     }
-    if let Some(e) = &entry {
-        ctx.history.save_text(e, &text, "transcript.raw.txt");
+    if let Some(e) = entry {
+        ctx.history.save_text(e, &raw, "transcript.raw.txt");
     }
 
-    let mode = ctx.state.take_mode();
+    let mut text = raw.clone();
     if mode == "llm"
         && ctx.c("DICTATE_LLM", "0") == "1"
         && !ctx.cfg.get("DICTATE_LLM_KEY").unwrap_or("").is_empty()
@@ -645,37 +694,20 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
 
     let noise = ctx.c("DICTATE_NOISE", text::DEFAULT_NOISE_PHRASES);
     if text::is_noise(&text, &noise) {
-        if let Some(e) = &entry {
+        if let Some(e) = entry {
             ctx.history.set_status(e, "discarded-noise");
         }
-        notify(ctx, "dictate: discarded noise", &text, 2000);
-        return Ok(());
+        return Ok(TextOutcome::Noise(text));
     }
 
     // Style last: the blocklist above matches whisper's own wording.
     text = text::restyle(&text, ctx.c("DICTATE_STYLE", "0") == "1", &ctx.c("DICTATE_PROMPT", ""));
-    if let Some(e) = &entry {
+    if let Some(e) = entry {
         ctx.history.save_text(e, &text, "transcript.txt");
         ctx.history.set_status(e, "ready");
     }
     ctx.mark("text_ready");
-
-    if ctx.c("DICTATE_NOTYPE", "0") == "1" {
-        ctx.clipboard().set(&text)?;
-        if let Some(e) = &entry {
-            ctx.history.set_status(e, "copied-to-clipboard");
-        }
-        notify(ctx, &format!("\u{1f4cb} {text}"), "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
-    } else {
-        notify(ctx, &text, "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
-        ctx.mark("overlay_submitted");
-        deliver(ctx, &text);
-        ctx.mark("delivery_returned");
-        if let Some(e) = &entry {
-            ctx.history.set_status(e, "delivery-attempted");
-        }
-    }
-    Ok(())
+    Ok(TextOutcome::Ready { raw, text })
 }
 
 /// Optional experimental ffmpeg filter chain (bash `$FILTER`); empty default.
@@ -834,6 +866,51 @@ pub fn cmd_retry(ctx: &Ctx, id: Option<&str>) -> Result<()> {
     }
     println!("retried {}", entry.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
     Ok(())
+}
+
+// ------------------------------------------------------------------ replay
+
+/// `replay [n]`: run the newest `n` saved dictations back through the same
+/// audio → text path as `stop` and compare against the transcript saved at
+/// the time. Read-only: no history writes, overlay, or delivery. Entries
+/// cleaned by the LLM pass are skipped, since replay never calls it.
+///
+/// A difference is not automatically a regression — prompt, model, or
+/// config may have changed since the recording — but on unchanged config it
+/// should be rare. Returns the exit code: 0 identical, 1 any difference.
+pub fn cmd_replay(ctx: &Ctx, n: usize) -> Result<i32> {
+    let (mut total, mut same) = (0, 0);
+    for entry in ctx.history.entries()? {
+        if total == n {
+            break;
+        }
+        let wav = entry.join("audio.wav");
+        let Ok(saved) = std::fs::read_to_string(entry.join("transcript.txt")) else { continue };
+        if !wav.is_file() || entry.join("transcript.cleaned.txt").exists() {
+            continue;
+        }
+        total += 1;
+        let id = entry.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let started = now_unix();
+        let now = match transcribe_to_text(ctx, &wav, None, "fast") {
+            Ok(TextOutcome::Ready { text, .. }) => text,
+            Ok(TextOutcome::Silence(_)) => "<silence>".into(),
+            Ok(TextOutcome::NoSpeech) => "<no speech>".into(),
+            Ok(TextOutcome::Noise(t)) => format!("<noise: {t}>"),
+            Err(e) => format!("<error: {e:#}>"),
+        };
+        let ms = (now_unix() - started) * 1000.0;
+        if now.trim() == saved.trim() {
+            same += 1;
+            println!("same  {id}  {ms:5.0}ms");
+        } else {
+            println!("DIFF  {id}  {ms:5.0}ms");
+            println!("      saved: {}", saved.trim());
+            println!("      now:   {}", now.trim());
+        }
+    }
+    println!("{same}/{total} identical");
+    Ok(if same == total { 0 } else { 1 })
 }
 
 // ------------------------------------------------------------------ toggle
