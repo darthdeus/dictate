@@ -325,6 +325,10 @@ pub fn local_iso_now() -> String {
 /// `ffprobe` duration of an archived clip, or `unknown` (bash default when
 /// `ffprobe` yields nothing).
 fn wav_duration(wav: &Path) -> String {
+    // Our own clips are read directly; ffprobe costs ~70 ms per dictation.
+    if let Ok(samples) = crate::wav::read_mono16(wav) {
+        return format!("{:.6}", samples.len() as f64 / crate::wav::RATE as f64);
+    }
     std::process::Command::new("ffprobe")
         .args(["-v", "quiet", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1"])

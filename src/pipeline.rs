@@ -201,6 +201,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
         label,
         text,
         tentative: String::new(),
+        stats: String::new(),
         engine: match phase {
             crate::overlay::Phase::Recording => "Rust \u{b7} live: whisper snapshots".to_string(),
             _ => ctx.final_label(),
@@ -468,11 +469,7 @@ pub fn server_up(server: &str) -> bool {
 /// previous mark, so slow dictations can be explained after the fact (the
 /// TSV itself is rewritten on every release).
 pub fn log_release_summary(ctx: &Ctx) {
-    let Ok(tsv) = std::fs::read_to_string(&ctx.paths.release_timing) else { return };
-    let marks: Vec<(&str, f64)> = tsv.lines().skip(1)
-        .filter_map(|l| l.split_once('\t'))
-        .filter_map(|(e, t)| Some((e, t.parse().ok()?)))
-        .collect();
+    let marks = release_marks(ctx);
     let (Some(first), Some(last)) = (marks.first(), marks.last()) else { return };
     let stages: Vec<String> = marks.windows(2)
         .map(|w| format!("{} +{:.0}", w[1].0, (w[1].1 - w[0].1) * 1000.0))
@@ -598,6 +595,11 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
 /// deliver.
 fn finish_stop(ctx: &Ctx) -> Result<()> {
     ctx.mark("audio_prepared");
+    // Save the clipboard for restoring while whisper runs, not after it
+    // (copyq answers in ~60 ms). A copy made in between would be lost.
+    let saved_clipboard = (ctx.c("DICTATE_NOTYPE", "0") != "1"
+        && ctx.c("DICTATE_CLIPBOARD", "restore") == "restore")
+        .then(|| std::thread::spawn(|| ProcessClipboard::new().get()));
     let started = std::fs::read_to_string(&ctx.paths.startfile)
         .unwrap_or_else(|_| crate::history::local_iso_now());
     let started = started.trim().to_string();
@@ -658,17 +660,66 @@ fn finish_stop(ctx: &Ctx) -> Result<()> {
         if let Some(e) = &entry {
             ctx.history.set_status(e, "copied-to-clipboard");
         }
-        notify(ctx, &format!("\u{1f4cb} {text}"), "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
+        notify_done(ctx, "Copied to clipboard", &text, entry.as_deref(), dur);
     } else {
-        notify(ctx, &text, "", ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
-        ctx.mark("overlay_submitted");
-        deliver(ctx, &text);
+        let prev = saved_clipboard.and_then(|h| h.join().ok());
+        deliver_with(ctx, &text, prev);
         ctx.mark("delivery_returned");
         if let Some(e) = &entry {
             ctx.history.set_status(e, "delivery-attempted");
         }
+        notify_done(ctx, "Pasted", &text, entry.as_deref(), dur);
     }
     Ok(())
+}
+
+/// Stage times of the current `stop`, from the release-timing TSV.
+fn release_marks(ctx: &Ctx) -> Vec<(String, f64)> {
+    std::fs::read_to_string(&ctx.paths.release_timing)
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(e, t)| Some((e.to_string(), t.parse().ok()?)))
+        .collect()
+}
+
+/// The finished-dictation card: the text plus how long each stage took, the
+/// models and the history id, so a slow or wrong dictation can be looked up.
+fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_secs: f64) {
+    let marks = release_marks(ctx);
+    let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
+    let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
+    let mut parts = vec![format!("{:.2} s total", now_unix() - ctx.command_started)];
+    if let Some(ms) = span("transcription_started", "transcription_finished") {
+        parts.push(format!("whisper {ms:.0} ms"));
+    }
+    if let Some(ms) = span("correction_started", "correction_finished") {
+        parts.push(format!("correction {ms:.0} ms"));
+    }
+    if let Some(ms) = span("text_ready", "delivery_returned") {
+        parts.push(format!("paste {ms:.0} ms"));
+    }
+    parts.push(format!("{audio_secs:.1} s audio"));
+    let mut stats = parts.join(" \u{b7} ");
+    if let Some(id) = entry.and_then(|e| e.file_name()) {
+        stats += &format!("\n{}", id.to_string_lossy());
+    }
+    let secs = ctx.c("DICTATE_OSD_DONE_MS", "5000").parse::<f64>().unwrap_or(5000.0) / 1000.0;
+    let msg = OverlayMessage {
+        phase: crate::overlay::Phase::Success,
+        label: label.into(),
+        text: text.into(),
+        tentative: String::new(),
+        engine: ctx.final_label(),
+        stats,
+        audio: String::new(),
+        channels: 1,
+        channel: 0,
+        duration: secs,
+        expires: now_unix() + secs,
+    };
+    let _ = JsonFileOverlay { state_path: ctx.overlay_path.clone() }.show(&msg);
 }
 
 /// What the audio → text half of `stop` produced for one clip.
@@ -923,6 +974,11 @@ fn llm_cleanup(ctx: &Ctx, raw: &str) -> String {
 /// Owns the clipboard from here: reads previous contents first (bash order),
 /// verifies ownership, sends one chord, restores in background.
 pub fn deliver(ctx: &Ctx, text: &str) {
+    deliver_with(ctx, text, None)
+}
+
+/// `deliver` with the clipboard to restore already read (`None`: read it now).
+fn deliver_with(ctx: &Ctx, text: &str, saved_clipboard: Option<String>) {
     let mode = InputMode::parse(&ctx.c("DICTATE_INPUT", "auto"));
     if mode == InputMode::Type {
         let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
@@ -936,7 +992,11 @@ pub fn deliver(ctx: &Ctx, text: &str) {
         DeliveryAction::Paste { chord } => {
             let clip = ctx.clipboard();
             ctx.mark("clipboard_backend_selected");
-            let prev = if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" { clip.get() } else { String::new() };
+            let prev = if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" {
+                saved_clipboard.unwrap_or_else(|| clip.get())
+            } else {
+                String::new()
+            };
             ctx.mark("clipboard_saved");
             if clip.set(text).is_err() {
                 let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));

@@ -39,6 +39,14 @@ def next_state(previous, incoming):
     return state
 
 
+def compact(state):
+    """Finished and failed dictations show as a small card at the top right."""
+    return state.get("phase") in ("success", "error")
+
+
+COMPACT_W = 640
+
+
 def rounded(cr, x, y, w, h, r):
     cr.new_sub_path()
     for cx, cy, start in ((x+w-r, y+r, -90), (x+w-r, y+h-r, 0),
@@ -67,7 +75,8 @@ class Overlay(Gtk.Window):
         self.levels = [0.0] * 36
         self.last_audio = None
         self.frame = 0
-        self.w = max(560, min(1600, int(os.getenv("DICTATE_OSD_WIDTH", "960"))))
+        self.full_w = max(560, min(1600, int(os.getenv("DICTATE_OSD_WIDTH", "960"))))
+        self.w = self.full_w
         self.h = 252
         self.target_h = 252
         self.monitor_rect = None
@@ -118,20 +127,51 @@ class Overlay(Gtk.Window):
             monitor = display.get_monitor_at_point(x, y)
         rect = monitor.get_geometry()
         self.monitor_rect = rect
-        self.x = rect.x + (rect.width-self.w)//2
-        self.base_y = rect.y + (rect.height-252)//2
+        self.w = COMPACT_W if compact(self.state) else self.full_w
+        if compact(self.state):
+            self.x = rect.x + rect.width - self.w - 24
+            self.base_y = rect.y + 24
+        else:
+            self.x = rect.x + (rect.width-self.w)//2
+            self.base_y = rect.y + (rect.height-252)//2
+        if self.get_realized():
+            self.reshape()
         self.y = min(self.base_y, rect.y+rect.height-24-self.target_h)
         self.move(self.x, self.y - (18 if self.motion else 0))
 
+    def measure(self, text, size):
+        layout = self.area.create_pango_layout(text)
+        font = Pango.FontDescription()
+        font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
+        font.set_absolute_size(size*Pango.SCALE)
+        layout.set_font_description(font)
+        layout.set_width((self.w-64)*Pango.SCALE)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        return layout.get_pixel_size()[1]
+
+    def card_foot(self):
+        return "\n".join(line for line in (self.state.get("stats", ""), self.state.get("engine") or "Bash") if line)
+
     def fit_text(self, reset=False):
+        small = compact(self.state)
         layout = self.area.create_pango_layout(self.state.get("text", ""))
         font = Pango.FontDescription()
         font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
-        font.set_absolute_size(self.size*Pango.SCALE)
+        font.set_absolute_size((18 if small else self.size)*Pango.SCALE)
         layout.set_font_description(font)
         layout.set_width((self.w-64)*Pango.SCALE)
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         _, text_height = layout.get_pixel_size()
+        if small:
+            foot = self.measure(self.card_foot(), 13)
+            desired = min(int(self.monitor_rect.height*0.4), text_height + foot + 86)
+            self.target_h = desired
+            self.y = self.base_y
+            self.resize(self.w, self.target_h)
+            self.move(self.x, self.y)
+            if self.get_realized():
+                self.reshape()
+            return
         limit = max(252, int(self.monitor_rect.height*0.75))
         desired = min(limit, max(252, text_height+139))
         # Don't shrink and shift paragraphs when the model revises wording.
@@ -160,6 +200,9 @@ class Overlay(Gtk.Window):
                         self.born = now
                         self.levels = [0.0] * 36
                     reset = not self.get_visible() or (state["phase"] == "recording" and not was_recording)
+                    if self.get_visible() and compact(state) != compact(previous):
+                        # The panel becomes the card (or back): move it, as if new.
+                        self.hide()
                     if not self.get_visible():
                         self.born = now
                         self.position()
@@ -249,11 +292,31 @@ class Overlay(Gtk.Window):
         cr.move_to(x, y)
         PangoCairo.show_layout(cr, layout)
 
+    def draw_card(self, cr, accent):
+        cr.set_source_rgb(0.055, 0.067, 0.09)
+        cr.paint()
+        rounded(cr, 1, 1, self.w-2, self.h-2, 23)
+        cr.set_source_rgb(0.19, 0.22, 0.27)
+        cr.set_line_width(1.5)
+        cr.stroke()
+        cr.set_source_rgb(*accent)
+        cr.arc(37, 33, 5, 0, math.tau)
+        cr.fill()
+        self.text(cr, self.state.get("label", "Ready").upper(), 54, 21, 15, accent, self.w-90, bold=True)
+        foot = self.card_foot()
+        foot_h = self.measure(foot, 13)
+        self.text(cr, self.state.get("text", ""), 32, 56, 18, (0.89, 0.92, 0.96), self.w-64,
+                  height=self.h-86-foot_h)
+        self.text(cr, foot, 32, self.h-20-foot_h, 13, (0.48, 0.54, 0.62), self.w-64, height=foot_h)
+
     def draw(self, _, cr):
         now = time.monotonic()
         phase = self.state.get("phase", "recording")
         accent = {"recording": (0.40, 0.88, 0.73), "processing": (0.65, 0.64, 1.0),
                   "success": (0.40, 0.88, 0.73), "error": (1.0, 0.63, 0.46)}[phase]
+        if compact(self.state):
+            self.draw_card(cr, accent)
+            return False
         cr.set_source_rgb(0.055, 0.067, 0.09)
         cr.paint()
         rounded(cr, 1, 1, self.w-2, self.h-2, 23)

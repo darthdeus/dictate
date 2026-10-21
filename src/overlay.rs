@@ -30,6 +30,9 @@ pub struct OverlayMessage {
     /// Which implementation and models are at work, e.g. "Rust · live: ...".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub engine: String,
+    /// Timings and history id of a finished dictation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stats: String,
     pub audio: String,
     pub channels: u32,
     pub channel: u32,
@@ -274,7 +277,7 @@ mod tests {
         let writer = JsonFileOverlay { state_path: dir.join("state.json") };
         let msg = OverlayMessage {
             phase: Phase::Recording, label: "Listening".into(), text: "hello".into(),
-            tentative: String::new(), engine: String::new(), audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
+            tentative: String::new(), engine: String::new(), stats: String::new(), audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
             duration: 300.0, expires: 1700000300.0,
         };
         writer.show(&msg).unwrap();
