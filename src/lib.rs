@@ -7,6 +7,7 @@
 //! `transcribe` so other platforms can be added without touching core.
 
 pub mod audio;
+pub mod boost;
 pub mod config;
 pub mod correct;
 pub mod daemon;

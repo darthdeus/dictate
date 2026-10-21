@@ -63,6 +63,12 @@ mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/dictate"
 cp config.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/dictate/config.toml"
 ```
 
+The streaming engine currently pins transcribe.cpp's unreleased
+`phrase-boost` commit from a local checkout (a `file://` git source in
+`Cargo.toml`); until that commit is pushed somewhere reachable, the build only
+works on a machine with that checkout. Point `git` at the published repository
+before packaging or publishing.
+
 `shell.nix` provides the toolchain (Rust, CMake, Vulkan headers and shader
 compiler for the transcribe.cpp streaming engine): `nix-shell --run 'cargo
 build --release'`.

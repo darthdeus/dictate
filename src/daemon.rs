@@ -70,8 +70,26 @@ fn right_context(ctx: &Ctx) -> i32 {
 }
 
 fn stream_options(right: i32) -> StreamOptions {
+    stream_options_boosted(right, None)
+}
+
+/// Stream setup for a dictation: the glossary phrase boost (`boost.rs`)
+/// goes in as the run vocabulary plus its weight.
+fn boosted_stream(ctx: &Ctx) -> (RunOptions, StreamOptions) {
+    let boost = crate::boost::preview_boost(&ctx.cfg);
+    let weight = boost.as_ref().map(|(_, w)| *w);
+    let run = RunOptions { vocabulary: boost.map(|(t, _)| t).unwrap_or_default(), ..Default::default() };
+    (run, stream_options_boosted(right_context(ctx), weight))
+}
+
+fn stream_options_boosted(right: i32, boost: Option<f32>) -> StreamOptions {
     StreamOptions {
-        family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions { att_context_right: Some(right) })),
+        family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
+            att_context_right: Some(right),
+            // Negative = off: no vocabulary, no boost (the library default
+            // would otherwise apply to a non-empty vocabulary).
+            vocabulary_boost: Some(boost.unwrap_or(-1.0)),
+        })),
         ..Default::default()
     }
 }
@@ -236,7 +254,8 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     let overlay = Publisher { ctx, level_path: &level_path, stop };
     overlay.show("", "");
 
-    let mut stream = session.stream(&RunOptions::default(), &stream_options(right_context(ctx)))?;
+    let (run, opts) = boosted_stream(ctx);
+    let mut stream = session.stream(&run, &opts)?;
     let mut audio: Vec<i16> = Vec::with_capacity(RATE as usize * 60);
     let mut early = EarlyWorker::new(ctx);
     let mut buf = vec![0u8; chunk_bytes];
