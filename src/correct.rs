@@ -40,6 +40,7 @@ pub struct Corrector {
     pub key: String,
     pub timeout: Duration,
     pub terms: String,
+    pub meter: Option<crate::usage::Meter>,
 }
 
 impl Corrector {
@@ -55,6 +56,7 @@ impl Corrector {
             key,
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_CORRECT_TIMEOUT", "5").parse().unwrap_or(5.0)),
             terms: terms.to_string(),
+            meter: None,
         })
     }
 
@@ -67,7 +69,20 @@ impl Corrector {
                 {"role": "user", "content": format!("<transcript>\n{text}\n</transcript>")}
             ]
         });
-        let resp: serde_json::Value = ureq::post(&self.url)
+        let t = std::time::Instant::now();
+        let resp: Result<serde_json::Value> = self.request(body);
+        if let Some(m) = &self.meter {
+            let tokens = |k: &str| resp.as_ref().ok().and_then(|r| r.pointer(&format!("/usage/{k}"))).and_then(|v| v.as_u64()).unwrap_or(0);
+            let (input, output) = (tokens("prompt_tokens"), tokens("completion_tokens"));
+            m.record(crate::usage::ApiCall { api: "groq".into(), model: self.model.clone(), input_tokens: input,
+                output_tokens: output, ms: t.elapsed().as_secs_f64() * 1000.0, ok: resp.is_ok(),
+                usd: (input as f64 * m.groq_in + output as f64 * m.groq_out) / 1e6, ..Default::default() });
+        }
+        self.finish(text, resp?)
+    }
+
+    fn request(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(ureq::post(&self.url)
             .timeout(self.timeout)
             .set("Authorization", &format!("Bearer {}", self.key))
             .send_json(body)
@@ -77,7 +92,10 @@ impl Corrector {
                     r.into_string().unwrap_or_default().chars().take(200).collect::<String>()),
                 ureq::Error::Transport(t) => anyhow::anyhow!("{}", t.kind()),
             })?
-            .into_json()?;
+            .into_json()?)
+    }
+
+    fn finish(&self, text: &str, resp: serde_json::Value) -> Result<String> {
         let out = resp
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())

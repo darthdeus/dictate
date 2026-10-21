@@ -125,6 +125,9 @@ impl Ctx {
         self.cfg.get("DICTATE_TERMS").map(str::to_string).unwrap_or_else(|| self.c("DICTATE_PROMPT", ""))
     }
     /// What produces the final text, shown on the overlay.
+    pub fn state_dir(&self) -> PathBuf {
+        self.log.parent().map(Path::to_path_buf).unwrap_or_default()
+    }
     pub(crate) fn final_label(&self) -> String {
         let mut label = if self.c("DICTATE_FINAL", "whisper") == "elevenlabs" {
             format!("Rust \u{b7} final: elevenlabs {}", self.c("DICTATE_ELEVENLABS_MODEL", crate::elevenlabs::DEFAULT_MODEL))
@@ -715,6 +718,17 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
         parts.push(format!("paste {ms:.0} ms"));
     }
     parts.push(format!("{audio_secs:.1} s audio"));
+    crate::usage::record_dictation(&ctx.state_dir(), &crate::usage::Dictation {
+        ts: now_unix(),
+        id: entry.and_then(|e| e.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        audio_secs,
+        setup: ctx.final_label(),
+        early_used: at("early_pass_used").is_some(),
+        total_ms: (now_unix() - ctx.command_started) * 1000.0,
+        recognizer_ms: at("early_pass_used").is_none().then(|| span("transcription_started", "transcription_finished")).flatten(),
+        correction_ms: at("early_pass_used").is_none().then(|| span("correction_started", "correction_finished")).flatten(),
+        paste_ms: span("text_ready", "delivery_returned"),
+    });
     let mut stats = parts.join(" \u{b7} ");
     if let Some(id) = entry.and_then(|e| e.file_name()) {
         stats += &format!("\n{}", id.to_string_lossy());
@@ -750,7 +764,7 @@ pub enum TextOutcome {
 /// when `entry` is given; overlay notices are left to the caller.
 fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str, early: Option<EarlyPass>)
     -> Result<TextOutcome> {
-    let pass = FinalPass::new(ctx);
+    let pass = FinalPass::new(ctx, "final");
 
     // Measured in-process for our own 16 kHz clips; ffmpeg cost ~100 ms here.
     let peak = match wav::read_mono16(wav) {
@@ -900,7 +914,10 @@ pub struct EarlyPass {
 }
 
 impl FinalPass {
-    pub fn new(ctx: &Ctx) -> Self {
+    /// `purpose` labels its paid requests in the usage log: `early` for the
+    /// daemon's pause passes, `final` after release.
+    pub fn new(ctx: &Ctx, purpose: &'static str) -> Self {
+        let meter = crate::usage::Meter::new(&ctx.state_dir(), &ctx.cfg, purpose);
         let mut whisper = WhisperConfig::new(
             &ctx.server(), &ctx.model(),
             &ctx.c("DICTATE_LANG", "auto"), &ctx.c("DICTATE_PROMPT", ""),
@@ -913,9 +930,13 @@ impl FinalPass {
             }
         }
         let corrector = (ctx.c("DICTATE_CORRECT", "0") == "1")
-            .then(|| Corrector::from_config(&ctx.cfg, &ctx.terms()).map_err(|e| format!("{e:#}")));
+            .then(|| Corrector::from_config(&ctx.cfg, &ctx.terms())
+                .map(|c| Corrector { meter: Some(meter.clone()), ..c })
+                .map_err(|e| format!("{e:#}")));
         let scribe = (ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs")
-            .then(|| crate::elevenlabs::Scribe::from_config(&ctx.cfg, &ctx.terms()).map_err(|e| format!("{e:#}")));
+            .then(|| crate::elevenlabs::Scribe::from_config(&ctx.cfg, &ctx.terms())
+                .map(|mut s| { s.meter = Some(meter.clone()); s })
+                .map_err(|e| format!("{e:#}")));
         Self {
             whisper,
             scribe,

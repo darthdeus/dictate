@@ -309,7 +309,7 @@ impl EarlyWorker {
     fn new(ctx: &Ctx) -> Self {
         let on = ctx.c("DICTATE_EARLY", "1") == "1";
         Self {
-            pass: on.then(|| Arc::new(FinalPass::new(ctx))),
+            pass: on.then(|| Arc::new(FinalPass::new(ctx, "early"))),
             level: ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0),
             pause_samples: ctx.c("DICTATE_EARLY_PAUSE_MS", "500").parse::<usize>().unwrap_or(500) * RATE as usize / 1000,
             speech_end: Arc::new(AtomicUsize::new(0)),

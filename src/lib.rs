@@ -22,6 +22,7 @@ pub mod state;
 pub mod text;
 pub mod timings;
 pub mod transcribe;
+pub mod usage;
 pub mod wav;
 
 /// Serializes tests that shell out to helper binaries (fake-script exec,

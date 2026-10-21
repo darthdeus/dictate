@@ -32,6 +32,11 @@ enum Command {
         /// `release` for release-to-paste, otherwise preview
         kind: Option<String>,
     },
+    /// API cost and speed per setup over the last DAYS
+    Stats {
+        #[arg(default_value = "30")]
+        days: f64,
+    },
     /// Check every dependency and print what's wrong
     Doctor,
     /// Record N secs and report peak/RMS dBFS
@@ -168,6 +173,9 @@ fn main() -> anyhow::Result<()> {
         Command::Replay { n } => {
             let code = pipeline::cmd_replay(&ctx()?, n)?;
             std::process::exit(code);
+        }
+        Command::Stats { days } => {
+            print!("{}", dictate_lib::usage::summarize(&ctx()?.state_dir(), days)?);
         }
         Command::Timings { kind } => {
             let c = ctx()?;

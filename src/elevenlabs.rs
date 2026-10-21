@@ -20,6 +20,7 @@ pub struct Scribe {
     lang: String,
     terms: Vec<String>,
     timeout: Duration,
+    pub meter: Option<crate::usage::Meter>,
 }
 
 impl Scribe {
@@ -32,6 +33,7 @@ impl Scribe {
             lang: if lang == "auto" { String::new() } else { lang },
             terms: terms.split(',').map(str::trim).filter(|t| !t.is_empty()).take(MAX_TERMS).map(String::from).collect(),
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_ELEVENLABS_TIMEOUT", "10").parse().unwrap_or(10.0)),
+            meter: None,
         })
     }
 
@@ -59,17 +61,29 @@ impl Scribe {
         body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
         body.extend_from_slice(&wav);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let resp: serde_json::Value = ureq::post(URL)
+        let t = std::time::Instant::now();
+        let resp = self.request(&boundary, &body);
+        if let Some(m) = &self.meter {
+            let secs = samples.len() as f64 / crate::wav::RATE as f64;
+            // Billed per second of audio sent, failed requests included.
+            m.record(crate::usage::ApiCall { api: "elevenlabs".into(), model: self.model.clone(), audio_secs: secs,
+                ms: t.elapsed().as_secs_f64() * 1000.0, ok: resp.is_ok(), usd: secs / 3600.0 * m.elevenlabs_hour,
+                ..Default::default() });
+        }
+        Ok(resp?.get("text").and_then(|t| t.as_str()).context("no text in response")?.trim().to_string())
+    }
+
+    fn request(&self, boundary: &str, body: &[u8]) -> Result<serde_json::Value> {
+        Ok(ureq::post(URL)
             .timeout(self.timeout)
             .set("xi-api-key", &self.key)
             .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
-            .send_bytes(&body)
+            .send_bytes(body)
             .map_err(|e| match e {
                 ureq::Error::Status(code, r) => anyhow::anyhow!("HTTP {code}: {}",
                     r.into_string().unwrap_or_default().chars().take(200).collect::<String>()),
                 ureq::Error::Transport(t) => anyhow::anyhow!("{}", t.kind()),
             })?
-            .into_json()?;
-        Ok(resp.get("text").and_then(|t| t.as_str()).context("no text in response")?.trim().to_string())
+            .into_json()?)
     }
 }
