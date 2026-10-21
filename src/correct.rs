@@ -48,11 +48,7 @@ impl Corrector {
     /// it never sits in the shared config.
     pub fn from_config(cfg: &Config, terms: &str) -> Result<Self> {
         let key_name = cfg.get_or("DICTATE_CORRECT_KEY", "GROQ_API_KEY");
-        let key = std::env::var(&key_name)
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| key_from_file(&key_name))
-            .with_context(|| format!("{key_name} not set and not in {}", keys_file().display()))?;
+        let key = key(&key_name)?;
         Ok(Self {
             url: cfg.get_or("DICTATE_CORRECT_URL", DEFAULT_URL),
             model: cfg.get_or("DICTATE_CORRECT_MODEL", DEFAULT_MODEL),
@@ -94,6 +90,15 @@ impl Corrector {
         }
         Ok(out)
     }
+}
+
+/// An API key by name, from the environment, else the private keys file.
+pub fn key(name: &str) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| key_from_file(name))
+        .with_context(|| format!("{name} not set and not in {}", keys_file().display()))
 }
 
 pub fn keys_file() -> std::path::PathBuf {

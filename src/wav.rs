@@ -13,8 +13,15 @@ pub const RATE: u32 = 16000;
 pub const WHISPER_PIECE_SECS: f64 = 28.0;
 
 pub fn write_mono16(path: &Path, samples: &[i16]) -> Result<()> {
+    let mut buf = Vec::new();
+    encode_mono16(&mut buf, samples);
+    std::fs::write(path, buf)?;
+    Ok(())
+}
+
+pub fn encode_mono16(buf: &mut Vec<u8>, samples: &[i16]) {
     let data_len = (samples.len() * 2) as u32;
-    let mut buf = Vec::with_capacity(44 + data_len as usize);
+    buf.reserve(44 + data_len as usize);
     buf.extend_from_slice(b"RIFF");
     buf.extend_from_slice(&(36 + data_len).to_le_bytes());
     buf.extend_from_slice(b"WAVEfmt ");
@@ -30,8 +37,6 @@ pub fn write_mono16(path: &Path, samples: &[i16]) -> Result<()> {
     for s in samples {
         buf.extend_from_slice(&s.to_le_bytes());
     }
-    std::fs::write(path, buf)?;
-    Ok(())
 }
 
 /// Reads 16 kHz mono 16-bit PCM, as written by `write_mono16` or ffmpeg

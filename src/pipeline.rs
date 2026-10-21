@@ -126,8 +126,12 @@ impl Ctx {
     }
     /// What produces the final text, shown on the overlay.
     pub(crate) fn final_label(&self) -> String {
-        let whisper = Path::new(&self.model()).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut label = format!("Rust \u{b7} final: whisper {}", whisper.trim_start_matches("ggml-"));
+        let mut label = if self.c("DICTATE_FINAL", "whisper") == "elevenlabs" {
+            format!("Rust \u{b7} final: elevenlabs {}", self.c("DICTATE_ELEVENLABS_MODEL", crate::elevenlabs::DEFAULT_MODEL))
+        } else {
+            let whisper = Path::new(&self.model()).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            format!("Rust \u{b7} final: whisper {}", whisper.trim_start_matches("ggml-"))
+        };
         if self.c("DICTATE_CORRECT", "0") == "1" {
             let model = self.c("DICTATE_CORRECT_MODEL", crate::correct::DEFAULT_MODEL);
             label += &format!(" + {}", model.rsplit('/').next().unwrap_or(&model));
@@ -701,7 +705,8 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
     if at("early_pass_used").is_some() {
         parts.push("final pass done during your pause".into());
     } else if let Some(ms) = span("transcription_started", "transcription_finished") {
-        parts.push(format!("whisper {ms:.0} ms"));
+        let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
+        parts.push(format!("{engine} {ms:.0} ms"));
     }
     if let Some(ms) = span("correction_started", "correction_finished") {
         parts.push(format!("correction {ms:.0} ms"));
@@ -873,6 +878,9 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str, e
 /// is ready the moment the key comes up (`EarlyPass`).
 pub struct FinalPass {
     whisper: WhisperConfig,
+    /// `DICTATE_FINAL=elevenlabs`: recognize with ElevenLabs instead of
+    /// whisper; whisper stays the fallback when the request fails.
+    scribe: Option<std::result::Result<crate::elevenlabs::Scribe, String>>,
     /// `None`: correction is off; `Err`: on but unusable (missing key).
     corrector: Option<std::result::Result<Corrector, String>>,
     log: PathBuf,
@@ -906,8 +914,11 @@ impl FinalPass {
         }
         let corrector = (ctx.c("DICTATE_CORRECT", "0") == "1")
             .then(|| Corrector::from_config(&ctx.cfg, &ctx.terms()).map_err(|e| format!("{e:#}")));
+        let scribe = (ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs")
+            .then(|| crate::elevenlabs::Scribe::from_config(&ctx.cfg, &ctx.terms()).map_err(|e| format!("{e:#}")));
         Self {
             whisper,
+            scribe,
             corrector,
             log: ctx.log.clone(),
             scratch: ctx.paths.datadir.clone(),
@@ -919,6 +930,14 @@ impl FinalPass {
     /// at pauses (see `wav::WHISPER_PIECE_SECS`), and silent pieces are
     /// skipped: whisper invents "Thank you." for silence.
     pub fn whisper(&self, samples: &[i16]) -> Result<String> {
+        match &self.scribe {
+            Some(Ok(scribe)) => match scribe.transcribe(samples) {
+                Ok(text) => return Ok(text),
+                Err(e) => append_log(&self.log, &format!("note: elevenlabs failed, using whisper: {e:#}")),
+            },
+            Some(Err(e)) => append_log(&self.log, &format!("note: elevenlabs unavailable, using whisper: {e}")),
+            None => {}
+        }
         use std::sync::atomic::{AtomicU64, Ordering};
         static PIECE: AtomicU64 = AtomicU64::new(0);
         let pieces = wav::split_at_pauses(samples, wav::WHISPER_PIECE_SECS);

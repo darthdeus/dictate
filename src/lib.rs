@@ -12,6 +12,7 @@ pub mod correct;
 pub mod daemon;
 pub mod delivery;
 pub mod doctor;
+pub mod elevenlabs;
 pub mod history;
 pub mod overlay;
 pub mod paths;
