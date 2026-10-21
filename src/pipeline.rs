@@ -620,11 +620,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
 /// deliver.
 fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     ctx.mark("audio_prepared");
-    // Save the clipboard for restoring while whisper runs, not after it
-    // (copyq answers in ~60 ms). A copy made in between would be lost.
-    let saved_clipboard = (ctx.c("DICTATE_NOTYPE", "0") != "1"
-        && ctx.c("DICTATE_CLIPBOARD", "restore") == "restore")
-        .then(|| std::thread::spawn(|| ProcessClipboard::new().get()));
+    let prefetch = (ctx.c("DICTATE_NOTYPE", "0") != "1").then(|| prefetch_delivery(ctx));
     let started = std::fs::read_to_string(&ctx.paths.startfile)
         .unwrap_or_else(|_| crate::history::local_iso_now());
     let started = started.trim().to_string();
@@ -687,8 +683,7 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
         }
         notify_done(ctx, "Copied to clipboard", &text, entry.as_deref(), dur);
     } else {
-        let prev = saved_clipboard.and_then(|h| h.join().ok());
-        deliver_with(ctx, &text, prev);
+        deliver_with(ctx, &text, prefetch);
         ctx.mark("delivery_returned");
         if let Some(e) = &entry {
             ctx.history.set_status(e, "delivery-attempted");
@@ -1200,20 +1195,37 @@ fn llm_cleanup(ctx: &Ctx, raw: &str) -> String {
 
 // ----------------------------------------------------------------- deliver
 
+/// Delivery work started while the text is still being recognized.
+pub struct DeliveryPrefetch {
+    saved_clipboard: Option<std::thread::JoinHandle<String>>,
+}
+
+/// Starts what `deliver_with` needs before the text exists, so it runs
+/// while whisper does.
+fn prefetch_delivery(ctx: &Ctx) -> DeliveryPrefetch {
+    // Save the clipboard for restoring while whisper runs, not after it
+    // (copyq answers in ~60 ms). A copy made in between would be lost.
+    let saved_clipboard = (ctx.c("DICTATE_CLIPBOARD", "restore") == "restore")
+        .then(|| std::thread::spawn(|| ProcessClipboard::new().get()));
+    DeliveryPrefetch { saved_clipboard }
+}
+
 /// Owns the clipboard from here: reads previous contents first (bash order),
 /// verifies ownership, sends one chord, restores in background.
 pub fn deliver(ctx: &Ctx, text: &str) {
     deliver_with(ctx, text, None)
 }
 
-/// `deliver` with the clipboard to restore already read (`None`: read it now).
-fn deliver_with(ctx: &Ctx, text: &str, saved_clipboard: Option<String>) {
+/// `deliver` with the work `prefetch_delivery` started (`None`: do it now).
+fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
+    let saved_clipboard = prefetch.and_then(|p| p.saved_clipboard).and_then(|h| h.join().ok());
     let mode = InputMode::parse(&ctx.c("DICTATE_INPUT", "auto"));
     if mode == InputMode::Type {
         let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
         return;
     }
     let cls = ctx.xdotool().active_window_class();
+    ctx.mark("window_class_read");
     match delivery::select_action(mode, &cls, &ctx.c("DICTATE_TERMINALS", delivery::DEFAULT_TERMINALS)) {
         DeliveryAction::Type => {
             let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
@@ -1253,6 +1265,44 @@ fn deliver_with(ctx: &Ctx, text: &str, saved_clipboard: Option<String>) {
             }
         }
     }
+}
+
+/// Hidden `dictate paste-bench`: `runs` deliveries of `text` (numbered) to
+/// the focused window, timed like `stop` times them, one TSV row of
+/// milliseconds per run. It changes the clipboard and sends keys: run it on
+/// an isolated X server (`DISPLAY=:77`), never on the desktop in use.
+pub fn cmd_paste_bench(ctx: &Ctx, text: &str, runs: usize, work_ms: u64, gap_ms: u64) -> Result<()> {
+    const STEPS: [&str; 7] = ["window_class_read", "clipboard_backend_selected", "clipboard_saved",
+        "clipboard_set", "clipboard_verified", "paste_shortcut_sent", "delivery_returned"];
+    println!("run\t{}\ttotal", STEPS.join("\t"));
+    ctx.timing_active.set(true);
+    for run in 0..runs {
+        let _ = std::fs::write(&ctx.paths.release_timing, "event\ttimestamp\n");
+        let prefetch = prefetch_delivery(ctx);
+        // Stands in for recognition, which the prefetch overlaps.
+        std::thread::sleep(std::time::Duration::from_millis(work_ms));
+        ctx.mark("text_ready");
+        deliver_with(ctx, &format!("{text} {run}"), Some(prefetch));
+        ctx.mark("delivery_returned");
+        let marks = release_marks(ctx);
+        let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
+        let t0 = at("text_ready").unwrap_or(0.0);
+        let mut prev = t0;
+        let mut row = vec![run.to_string()];
+        for step in STEPS {
+            match at(step) {
+                Some(t) => {
+                    row.push(format!("{:.1}", (t - prev) * 1000.0));
+                    prev = t;
+                }
+                None => row.push("-".into()),
+            }
+        }
+        row.push(format!("{:.1}", (prev - t0) * 1000.0));
+        println!("{}", row.join("\t"));
+        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------- retry

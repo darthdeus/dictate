@@ -93,6 +93,20 @@ enum Command {
     /// Hidden: ElevenLabs shadow label for one history entry (spawned by `stop`)
     #[command(hide = true)]
     Shadow { entry: std::path::PathBuf },
+    /// Hidden: time deliveries to the focused window (isolated X server only)
+    #[command(hide = true)]
+    PasteBench {
+        #[arg(long, default_value = "20")]
+        runs: usize,
+        /// Simulated recognition time the prefetch overlaps, ms
+        #[arg(long, default_value = "300")]
+        work_ms: u64,
+        /// Pause between runs, ms (let restores finish)
+        #[arg(long, default_value = "1200")]
+        gap_ms: u64,
+        #[arg(default_value = "Paste bench text")]
+        text: String,
+    },
     /// Hidden: clipboard restore worker (spawned detached by `stop`/`retry`)
     #[command(hide = true)]
     RestoreClipboard {
@@ -131,6 +145,9 @@ fn main() -> anyhow::Result<()> {
                 &copyq_bin,
             );
             return Ok(());
+        }
+        Command::PasteBench { runs, work_ms, gap_ms, text } => {
+            return pipeline::cmd_paste_bench(&ctx()?, &text, runs, work_ms, gap_ms);
         }
         Command::Start { mode } => {
             let c = ctx()?;
