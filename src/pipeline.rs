@@ -710,13 +710,13 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
         parts.push("final pass\tin pause\t".into());
     } else if let Some(ms) = span("transcription_started", "transcription_finished") {
         let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
-        parts.push(format!("{engine}\t{ms:.0}\tms"));
+        parts.push(format!("{engine}\t{:.2}\ts", ms / 1000.0));
     }
     if let Some(ms) = span("correction_started", "correction_finished") {
-        parts.push(format!("correction\t{ms:.0}\tms"));
+        parts.push(format!("correction\t{:.2}\ts", ms / 1000.0));
     }
     if let Some(ms) = span("text_ready", "delivery_returned") {
-        parts.push(format!("paste\t{ms:.0}\tms"));
+        parts.push(format!("paste\t{:.2}\ts", ms / 1000.0));
     }
     parts.push(format!("audio\t{audio_secs:.1}\ts"));
     crate::usage::record_dictation(&ctx.state_dir(), &crate::usage::Dictation {
