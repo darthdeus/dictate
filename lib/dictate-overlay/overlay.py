@@ -35,7 +35,7 @@ def next_state(previous, incoming):
     state = dict(incoming)
     if (state.get("phase") == "processing" and not state.get("text")
             and previous.get("phase") in ("recording", "processing")):
-        state["text"] = previous.get("text", "")
+        state["text"] = previous.get("text", "") + previous.get("tentative", "")
     return state
 
 
@@ -218,7 +218,8 @@ class Overlay(Gtk.Window):
         value = max(target, self.levels[-1]*0.86)
         self.levels = self.levels[1:] + [value]
 
-    def text(self, cr, text, x, y, size, color, width=None, lines=1, bold=False, height=None, changes=None):
+    def text(self, cr, text, x, y, size, color, width=None, lines=1, bold=False, height=None, changes=None,
+             dim_from=None):
         layout = PangoCairo.create_layout(cr)
         font = Pango.FontDescription()
         font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
@@ -231,14 +232,19 @@ class Overlay(Gtk.Window):
             layout.set_wrap(Pango.WrapMode.WORD_CHAR)
             layout.set_height(height*Pango.SCALE if height else -lines)
             layout.set_ellipsize(Pango.EllipsizeMode.START if self.state.get("phase") in ("recording", "processing") else Pango.EllipsizeMode.END)
+        attributes = Pango.AttrList()
         if changes:
             ranges, tint = changes
-            attributes = Pango.AttrList()
             for start, end in ranges:
                 attr = Pango.attr_foreground_new(*(round(c*65535) for c in tint))
                 attr.start_index, attr.end_index = start, end
                 attributes.insert(attr)
-            layout.set_attributes(attributes)
+        if dim_from is not None:
+            # Streaming preview: the tail after the committed text may still change.
+            attr = Pango.attr_foreground_new(*(round(c*65535) for c in (0.48, 0.54, 0.62)))
+            attr.start_index, attr.end_index = dim_from, len(text.encode("utf-8"))
+            attributes.insert(attr)
+        layout.set_attributes(attributes)
         cr.set_source_rgb(*color)
         cr.move_to(x, y)
         PangoCairo.show_layout(cr, layout)
@@ -269,12 +275,16 @@ class Overlay(Gtk.Window):
             meta = "DICTATION"
         self.text(cr, meta, self.w-177, 25, 15, (0.48, 0.54, 0.62))
         body = self.state.get("text", "")
+        tentative = self.state.get("tentative", "")
+        dim_from = len(body.encode("utf-8")) if tentative else None
+        body += tentative
         if not body:
             body = "Speak naturally…" if phase == "recording" else "Preparing your text…"
         fade = min(1, (now-self.changed)/0.14) if self.motion else 1
         color = tuple(a+(b-a)*fade for a, b in zip((0.30, 0.35, 0.41), (0.89, 0.92, 0.96)))
         self.text(cr, body, 32, 68, self.size, (0.89, 0.92, 0.96), self.w-64, 3,
-                  height=self.h-139, changes=(self.changed_ranges, color) if fade < 1 else None)
+                  height=self.h-139, changes=(self.changed_ranges, color) if fade < 1 else None,
+                  dim_from=dim_from)
         cr.set_source_rgb(0.14, 0.17, 0.21)
         cr.rectangle(32, self.h-57, self.w-64, 1)
         cr.fill()

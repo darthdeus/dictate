@@ -8,6 +8,8 @@
 
 pub mod audio;
 pub mod config;
+pub mod correct;
+pub mod daemon;
 pub mod delivery;
 pub mod doctor;
 pub mod history;
@@ -19,6 +21,7 @@ pub mod state;
 pub mod text;
 pub mod timings;
 pub mod transcribe;
+pub mod wav;
 
 /// Serializes tests that shell out to helper binaries (fake-script exec,
 /// `grep -E` matching). Under parallel load, back-to-back exec in this

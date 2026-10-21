@@ -24,6 +24,9 @@ pub struct OverlayMessage {
     pub phase: Phase,
     pub label: String,
     pub text: String,
+    /// Still-revisable tail after `text`, drawn dimmed (streaming preview).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tentative: String,
     pub audio: String,
     pub channels: u32,
     pub channel: u32,
@@ -268,7 +271,7 @@ mod tests {
         let writer = JsonFileOverlay { state_path: dir.join("state.json") };
         let msg = OverlayMessage {
             phase: Phase::Recording, label: "Listening".into(), text: "hello".into(),
-            audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
+            tentative: String::new(), audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
             duration: 300.0, expires: 1700000300.0,
         };
         writer.show(&msg).unwrap();

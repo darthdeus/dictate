@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::audio::{self, AudioBackend, ProcessAudio, RawFormat};
 use crate::config::Config;
+use crate::correct::Corrector;
+use crate::daemon;
 use crate::delivery::{self, DeliveryAction, InputMode, ProcessClipboard, Xdotool};
 use crate::history::HistoryStore;
 use crate::overlay::{map_notify, JsonFileOverlay, OverlayBackend, OverlayMessage};
@@ -23,6 +25,7 @@ use crate::paths::Paths;
 use crate::state::{self, Claim, RecordingState};
 use crate::text;
 use crate::transcribe::{self, Engine, ParakeetConfig, WhisperConfig};
+use crate::wav;
 
 /// Everything a command needs, built once in `main`.
 pub struct Ctx {
@@ -85,10 +88,10 @@ impl Ctx {
         self.timing_active.get().then_some(self.paths.release_timing.as_path())
     }
 
-    fn c(&self, key: &str, default: &str) -> String {
+    pub(crate) fn c(&self, key: &str, default: &str) -> String {
         self.cfg.get_or(key, default)
     }
-    fn mic(&self) -> String {
+    pub(crate) fn mic(&self) -> String {
         self.c("DICTATE_MIC", "auto")
     }
     fn pulse_mic(&self) -> String {
@@ -98,13 +101,13 @@ impl Ctx {
     fn engine(&self) -> Engine {
         Engine::parse(&self.c("DICTATE_ENGINE", "whisper"))
     }
-    fn channels(&self) -> u32 {
+    pub(crate) fn channels(&self) -> u32 {
         self.c("DICTATE_CHANNELS", "1").parse().unwrap_or(1).max(1)
     }
-    fn chan(&self) -> u32 {
+    pub(crate) fn chan(&self) -> u32 {
         self.c("DICTATE_CHAN", "0").parse().unwrap_or(0)
     }
-    fn max_secs(&self) -> u64 {
+    pub(crate) fn max_secs(&self) -> u64 {
         self.c("DICTATE_MAX_SECS", "300").parse().unwrap_or(300)
     }
     fn model(&self) -> String {
@@ -115,6 +118,11 @@ impl Ctx {
     }
     fn vad_model(&self) -> String {
         self.c("DICTATE_VAD_MODEL", &default_model_file("ggml-silero-v5.1.2.bin"))
+    }
+    /// Glossary for restyle and correction. Separate from the whisper
+    /// prompt, which reads best as an example sentence.
+    fn terms(&self) -> String {
+        self.cfg.get("DICTATE_TERMS").map(str::to_string).unwrap_or_else(|| self.c("DICTATE_PROMPT", ""))
     }
     fn server(&self) -> String {
         // Explicit empty forces CLI; unset means default URL.
@@ -161,7 +169,7 @@ fn overlay_state_path(rundir: &Path) -> PathBuf {
     rundir.join(format!("dictate-overlay-{}", uid_string())).join("state.json")
 }
 
-fn append_log(log: &Path, line: &str) {
+pub(crate) fn append_log(log: &Path, line: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(f, "{line}");
@@ -182,6 +190,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
         phase,
         label,
         text,
+        tentative: String::new(),
         audio: ctx.paths.raw.display().to_string(),
         channels: ctx.channels(),
         channel: ctx.chan(),
@@ -300,6 +309,20 @@ pub fn reap_recorders() {
 /// `dictate start [llm]`. Idempotent: second call while recording is a no-op.
 pub fn cmd_start(ctx: &Ctx, llm_mode: bool) -> Result<()> {
     ctx.state.write_mode(if llm_mode { "llm" } else { "fast" })?;
+    // A running daemon owns capture and the streaming preview; it publishes
+    // to the overlay itself, so only the renderer needs starting here.
+    match daemon::request(&ctx.paths, "start").as_deref() {
+        Some("ok") => {
+            std::fs::write(&ctx.paths.startfile, crate::history::local_iso_now())?;
+            if ctx.cfg.get("DICTATE_OSD_BACKEND").unwrap_or("gtk") != "feh" {
+                spawn_renderer(&ctx.log);
+            }
+            return Ok(());
+        }
+        Some("busy") => return Ok(()),
+        Some(err) => append_log(&ctx.log, &format!("dictate daemon: {err}; recording without it")),
+        None => {}
+    }
     match ctx.state.claim(std::process::id())? {
         Claim::AlreadyRecording => return Ok(()),
         Claim::Claimed => {}
@@ -466,6 +489,21 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
     let started_ts = ctx.command_started;
     ctx.mark_at("command_started", started_ts);
     ctx.mark("stop_entered");
+    match daemon::request(&ctx.paths, "stop").as_deref() {
+        Some(r) if r.starts_with("ok") => {
+            ctx.mark("recorder_stopped");
+            notify(ctx, "\u{23f3} Transcribing", "", 30000);
+            return finish_stop(ctx);
+        }
+        Some(r) if r.starts_with("error") => {
+            let _ = std::fs::remove_file(&ctx.paths.startfile);
+            append_log(&ctx.log, &format!("dictate daemon: {r}"));
+            notify(ctx, "dictate: recording failed", r.trim_start_matches("error "), 4000);
+            return Ok(());
+        }
+        // "idle" or no daemon: this recording, if any, is the per-process one.
+        _ => {}
+    }
     // No pidfile != not recording (orphan sweep, like bash).
     let recorded = if ctx.paths.pidfile.exists() {
         let pid = ctx.state.take_recorded_pid();
@@ -522,6 +560,12 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
+    finish_stop(ctx)
+}
+
+/// The rest of `stop` once `Paths::wav` holds the clip: archive, transcribe,
+/// deliver.
+fn finish_stop(ctx: &Ctx) -> Result<()> {
     ctx.mark("audio_prepared");
     let started = std::fs::read_to_string(&ctx.paths.startfile)
         .unwrap_or_else(|_| crate::history::local_iso_now());
@@ -651,7 +695,7 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
             };
             transcribe::transcribe_parakeet(&feed, &pc, &ctx.log)
         }
-        Engine::Whisper => transcribe::transcribe_whisper(&feed, &whisper, &ctx.log),
+        Engine::Whisper => transcribe_whisper_pieces(ctx, &feed, &whisper),
     };
     let Ok(raw_text) = raw_text else {
         if let Some(e) = entry {
@@ -700,14 +744,52 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
         return Ok(TextOutcome::Noise(text));
     }
 
+    if ctx.c("DICTATE_CORRECT", "0") == "1" {
+        ctx.mark("correction_started");
+        match Corrector::from_config(&ctx.cfg, &ctx.terms()).and_then(|c| c.correct(&text)) {
+            Ok(fixed) => {
+                if fixed != text {
+                    if let Some(e) = entry {
+                        ctx.history.save_text(e, &fixed, "transcript.corrected.txt");
+                    }
+                    text = fixed;
+                }
+            }
+            Err(e) => append_log(&ctx.log, &format!("note: correction skipped, keeping whisper text: {e:#}")),
+        }
+        ctx.mark("correction_finished");
+    }
+
     // Style last: the blocklist above matches whisper's own wording.
-    text = text::restyle(&text, ctx.c("DICTATE_STYLE", "0") == "1", &ctx.c("DICTATE_PROMPT", ""));
+    text = text::restyle(&text, ctx.c("DICTATE_STYLE", "0") == "1", &ctx.terms());
     if let Some(e) = entry {
         ctx.history.save_text(e, &text, "transcript.txt");
         ctx.history.set_status(e, "ready");
     }
     ctx.mark("text_ready");
     Ok(TextOutcome::Ready { raw, text })
+}
+
+/// Long clips go to whisper in pieces cut at pauses (see
+/// `wav::WHISPER_PIECE_SECS`); a clip that cannot be read here goes whole.
+fn transcribe_whisper_pieces(ctx: &Ctx, wav_path: &Path, cfg: &WhisperConfig) -> Result<String> {
+    let samples = match wav::read_mono16(wav_path) {
+        Ok(s) => s,
+        Err(_) => return transcribe::transcribe_whisper(wav_path, cfg, &ctx.log),
+    };
+    let pieces = wav::split_at_pauses(&samples, wav::WHISPER_PIECE_SECS);
+    if pieces.len() == 1 {
+        return transcribe::transcribe_whisper(wav_path, cfg, &ctx.log);
+    }
+    let mut texts = Vec::new();
+    for (i, range) in pieces.into_iter().enumerate() {
+        let piece = ctx.paths.datadir.join(format!("dictate-piece-{}-{i}.wav", std::process::id()));
+        wav::write_mono16(&piece, &samples[range])?;
+        let text = transcribe::transcribe_whisper(&piece, cfg, &ctx.log);
+        let _ = std::fs::remove_file(&piece);
+        texts.push(text?);
+    }
+    Ok(texts.join(" "))
 }
 
 /// Optional experimental ffmpeg filter chain (bash `$FILTER`); empty default.
@@ -916,7 +998,9 @@ pub fn cmd_replay(ctx: &Ctx, n: usize) -> Result<i32> {
 // ------------------------------------------------------------------ toggle
 
 pub fn cmd_toggle(ctx: &Ctx) -> Result<()> {
-    if state::read_live_pid(&ctx.paths.pidfile).is_some() {
+    if state::read_live_pid(&ctx.paths.pidfile).is_some()
+        || daemon::request(&ctx.paths, "status").as_deref() == Some("recording")
+    {
         cmd_stop(ctx)
     } else {
         cmd_start(ctx, false)

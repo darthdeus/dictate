@@ -43,6 +43,8 @@ enum Command {
     Meter,
     /// Run resident whisper-server in foreground
     Serve,
+    /// Run the streaming preview engine in foreground (start/stop use it)
+    Daemon,
     /// Per-channel levels to find mic on multi-input interface
     Scan {
         #[arg(default_value = "6")]
@@ -136,6 +138,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Meter => {
             pipeline::cmd_meter(&ctx()?)?;
+        }
+        Command::Daemon => {
+            dictate_lib::daemon::run(&ctx)?;
         }
         Command::Serve => {
             pipeline::cmd_serve(&ctx()?)?;

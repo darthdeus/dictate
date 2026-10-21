@@ -22,3 +22,4 @@ __pycache__/
 
 # Rust build output (new port lives in src/, target/ is regenerable).
 /target/
+/.gcroot-shell
