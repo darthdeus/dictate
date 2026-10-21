@@ -76,6 +76,9 @@ fn stream_options(right: i32) -> StreamOptions {
 
 struct Recording {
     recorder: u32,
+    /// `Paths::pidfile`, holding the recorder's pid while recording: the
+    /// polybar clock reads its age to show (and flag stuck) recordings.
+    pidfile: PathBuf,
     stop: Arc<AtomicBool>,
     wav: PathBuf,
     early_path: PathBuf,
@@ -175,6 +178,8 @@ fn start(ctx: Ctx, session: Session) -> std::result::Result<Recording, (Session,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let recorder = child.id();
+    let pidfile = ctx.paths.pidfile.clone();
+    let _ = std::fs::write(&pidfile, recorder.to_string());
     let wav = ctx.paths.wav.clone();
     let early_path = early_pass_path(&ctx.paths);
     let _ = std::fs::remove_file(&early_path);
@@ -187,7 +192,7 @@ fn start(ctx: Ctx, session: Session) -> std::result::Result<Recording, (Session,
         }
         (session, res)
     });
-    Ok(Recording { recorder, stop, wav, early_path, thread })
+    Ok(Recording { recorder, pidfile, stop, wav, early_path, thread })
 }
 
 fn stop(r: Recording) -> (Session, String) {
@@ -196,6 +201,7 @@ fn stop(r: Recording) -> (Session, String) {
     // SIGINT makes pw-record flush and exit; the reader then sees EOF.
     crate::state::send_int(r.recorder);
     let (session, res) = r.thread.join().expect("dictate daemon: capture thread panicked");
+    let _ = std::fs::remove_file(&r.pidfile);
     let reply = match res.and_then(|(audio, early)| {
         wav::write_mono16(&r.wav, &audio)?;
         let early = match early {

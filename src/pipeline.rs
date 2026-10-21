@@ -219,7 +219,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
     if ctx.cfg.get("DICTATE_OSD_BACKEND").unwrap_or("gtk") == "feh" {
         return;
     }
-    spawn_renderer(&ctx.log);
+    spawn_renderer(ctx);
 }
 
 fn renderer_binary() -> String {
@@ -244,10 +244,11 @@ fn renderer_binary() -> String {
     "dictate-overlay".into()
 }
 
-fn spawn_renderer(log: &Path) {
-    let logfile = std::fs::OpenOptions::new().create(true).append(true).open(log).ok();
+fn spawn_renderer(ctx: &Ctx) {
+    let logfile = std::fs::OpenOptions::new().create(true).append(true).open(&ctx.log).ok();
     let null = std::fs::OpenOptions::new().read(true).open("/dev/null").ok();
     let mut cmd = std::process::Command::new(renderer_binary());
+    cmd.envs(ctx.cfg.osd_vars());
     if let Some(n) = null {
         cmd.stdin(n);
     } else {
@@ -330,7 +331,7 @@ pub fn cmd_start(ctx: &Ctx, llm_mode: bool) -> Result<()> {
         Some("ok") => {
             std::fs::write(&ctx.paths.startfile, crate::history::local_iso_now())?;
             if ctx.cfg.get("DICTATE_OSD_BACKEND").unwrap_or("gtk") != "feh" {
-                spawn_renderer(&ctx.log);
+                spawn_renderer(ctx);
             }
             return Ok(());
         }

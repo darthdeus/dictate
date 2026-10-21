@@ -130,6 +130,12 @@ impl Config {
         self.get(key).unwrap_or(default).to_string()
     }
 
+    /// The renderer's settings (`DICTATE_OSD_*`), file values included: the
+    /// renderer only sees its environment.
+    pub fn osd_vars(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.values.iter().filter(|(k, _)| k.starts_with("DICTATE_OSD_")).map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Re-expose merged values as an `Env` (for path resolution, which reads
     /// `DICTATE_DIR` / `DICTATE_HISTORY*` with defaults < file < env applied).
     pub fn as_env(&self, base: &Env) -> Env {
