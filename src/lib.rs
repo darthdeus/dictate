@@ -18,6 +18,7 @@ pub mod overlay;
 pub mod paths;
 pub mod pipeline;
 pub mod preview;
+pub mod segment;
 pub mod state;
 pub mod text;
 pub mod timings;

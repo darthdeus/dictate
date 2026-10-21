@@ -80,6 +80,13 @@ enum Command {
         #[arg(default_value = "20")]
         n: usize,
     },
+    /// Hidden: whisper on whole clips vs on their pause segments
+    #[command(hide = true)]
+    Segbench {
+        #[arg(short)]
+        verbose: bool,
+        wavs: Vec<std::path::PathBuf>,
+    },
     /// Hidden: live-preview scheduler (spawned by `start`)
     #[command(hide = true)]
     PreviewWorker,
@@ -162,6 +169,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Bench { wav } => {
             pipeline::cmd_bench(&ctx()?, wav.as_deref())?;
+        }
+        Command::Segbench { verbose, wavs } => {
+            pipeline::cmd_segbench(&ctx()?, &wavs, verbose)?;
         }
         Command::History { n } => {
             let c = ctx()?;

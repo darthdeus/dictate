@@ -10,10 +10,12 @@
 //! the final pass (whisper, optional correction) and delivers, since it has
 //! the X session that typing and the clipboard need.
 //!
-//! While you pause mid-recording it already runs that final pass on the
-//! audio so far (`EarlyWorker`). If the pause was the end, `stop` replies
-//! `ok <seconds> early` and leaves the result at `early_pass_path`, so the
-//! stop process only has to paste.
+//! While you pause mid-recording it already runs that final pass
+//! (`EarlyWorker`): by default only on the audio since the previous pause
+//! (`segment`), else on all the audio so far. `stop` then replies
+//! `ok <seconds> early` and leaves the result at `early_pass_path`: if the
+//! pause was the end the stop process only has to paste, otherwise it
+//! recognizes just the audio after the last cut.
 //!
 //! Protocol, one request line and one reply line:
 //!   start  -> ok | busy | error <why>
@@ -286,45 +288,94 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     Ok((audio, early))
 }
 
-/// Runs the final pass in the background whenever the speaker pauses, on
-/// the audio so far. A pass whose snapshot covers all the speech is used at
-/// stop; one overtaken by new speech is dropped, and the next pause starts
-/// another. Correction is skipped when speech resumed during whisper, which
-/// keeps Groq requests (rate-limited per minute) to about one per pause.
+/// Runs the final pass in the background whenever the speaker pauses.
+///
+/// Whole mode (`DICTATE_INCREMENTAL=0`): each pass covers the audio so far.
+/// A pass whose snapshot covers all the speech is used at stop; one
+/// overtaken by new speech is dropped, and the next pause starts another.
+///
+/// Incremental mode (the default, see `segment`): each pass recognizes only
+/// the audio since the last cut, up to a new cut inside the pause, and
+/// appends it to the text so far. The cut is kept once the segment holds
+/// `DICTATE_SEGMENT_MIN_MS` of audio up to its last speech: whisper is less
+/// accurate on short pieces. A pass over less is speculative: it is used if
+/// the pause turns out to be the end, and otherwise dropped, its audio going
+/// again into the next segment. Kept segments tile the recording; speech
+/// resuming during a pass only lands in the next one.
+///
+/// Either way correction (on the whole text) is skipped when speech resumed
+/// during the pass, which keeps Groq requests (rate-limited per minute) to
+/// about one per pause.
 struct EarlyWorker {
     pass: Option<Arc<FinalPass>>,
+    incremental: bool,
     /// A chunk whose peak is at or above this (dBFS) is speech.
     level: f32,
     pause_samples: usize,
+    min_segment: usize,
     /// End of the last speech chunk, shared with the running pass.
     speech_end: Arc<AtomicUsize>,
-    running: Option<(usize, usize, JoinHandle<Option<EarlyPass>>)>,
-    /// A finished pass, the audio length it covered and how many words of
-    /// the live text it replaces in the preview.
-    done: Option<(usize, usize, EarlyPass)>,
+    running: Option<Running>,
+    /// The latest pass that covers the speech so far (whole mode), or the
+    /// kept segments (incremental).
+    done: Option<Done>,
+    /// Incremental: the kept segments plus a speculative one after them.
+    speculative: Option<Done>,
+    /// `speech_end` when the last incremental pass started: one pass per
+    /// pause, and a failed one is retried only after new speech (or at stop).
+    tried_at: usize,
     spoke: bool,
+}
+
+struct Running {
+    /// Audio the pass covers: `[0, len)`.
+    len: usize,
+    /// Incremental: whether its cut is kept.
+    keep: bool,
+    thread: JoinHandle<Option<Done>>,
+}
+
+/// A finished pass.
+struct Done {
+    /// The audio length it covers.
+    len: usize,
+    /// How many words of the live text it replaces in the preview.
+    words: usize,
+    pass: EarlyPass,
+    /// What the preview shows for it: the correction, or when that was
+    /// skipped, the previous segments' shown text plus the new segment.
+    shown: String,
 }
 
 impl EarlyWorker {
     fn new(ctx: &Ctx) -> Self {
         let on = ctx.c("DICTATE_EARLY", "1") == "1";
+        let ms = |key: &str, default: &str| ctx.c(key, default).parse::<usize>().unwrap_or(default.parse().unwrap()) * RATE as usize / 1000;
         Self {
             pass: on.then(|| Arc::new(FinalPass::new(ctx, "early"))),
+            incremental: ctx.c("DICTATE_INCREMENTAL", "1") == "1",
             level: ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0),
-            pause_samples: ctx.c("DICTATE_EARLY_PAUSE_MS", "500").parse::<usize>().unwrap_or(500) * RATE as usize / 1000,
+            pause_samples: ms("DICTATE_EARLY_PAUSE_MS", "500"),
+            min_segment: ms("DICTATE_SEGMENT_MIN_MS", crate::segment::MIN_SEGMENT_MS),
             speech_end: Arc::new(AtomicUsize::new(0)),
             running: None,
             done: None,
+            speculative: None,
+            tried_at: 0,
             spoke: false,
         }
+    }
+
+    /// Where the kept segments end (the last cut).
+    fn cut(&self) -> usize {
+        self.done.as_ref().map_or(0, |d| d.len)
     }
 
     /// Called after each chunk is appended to `audio`, with the live text so
     /// far; true when a pass just finished (the preview changes).
     fn heard(&mut self, audio: &[i16], committed: &str, tentative: &str) -> bool {
         let Some(pass) = self.pass.clone() else { return false };
-        let chunk = RATE as usize * CHUNK_MS / 1000;
-        let tail = &audio[audio.len().saturating_sub(chunk)..];
+        let tail = &audio[audio.len().saturating_sub(crate::segment::CHUNK)..];
         if wav::peak_db(tail) >= self.level {
             self.spoke = true;
             self.speech_end.store(audio.len(), Ordering::SeqCst);
@@ -332,49 +383,92 @@ impl EarlyWorker {
         }
         let finished = self.collect();
         let speech_end = self.speech_end.load(Ordering::SeqCst);
-        let covered = self.done.as_ref().map_or(0, |d| d.0).max(self.running.as_ref().map_or(0, |r| r.0));
+        let covered = if self.incremental {
+            self.cut().max(self.tried_at)
+        } else {
+            self.cut().max(self.running.as_ref().map_or(0, |r| r.len))
+        };
         if !self.spoke || self.running.is_some() || covered >= speech_end || audio.len() - speech_end < self.pause_samples {
             return finished;
         }
         let words = committed.split_whitespace().count() + tentative.split_whitespace().count();
-        let (samples, speech) = (audio.to_vec(), self.speech_end.clone());
-        let len = samples.len();
-        self.running = Some((len, words, std::thread::spawn(move || {
-            let raw = pass.whisper(&samples).ok()?;
-            let clean = crate::text::clean_whisper_text(&raw);
-            let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
-                None
-            } else {
-                pass.correct(&clean).and_then(Result::ok)
-            };
-            Some(EarlyPass { raw, clean, corrected })
-        })));
+        let speech = self.speech_end.clone();
+        let len = if self.incremental { crate::segment::cut_in_pause(audio, speech_end) } else { audio.len() };
+        let thread = if self.incremental {
+            self.tried_at = speech_end;
+            let (prev, shown) = self.done.as_ref().map(|d| (d.pass.clone(), d.shown.clone())).unwrap_or_default();
+            let samples = audio[self.cut()..len].to_vec();
+            std::thread::spawn(move || {
+                let context = prev.corrected.as_deref().unwrap_or(&prev.clean);
+                let segment = pass.recognize(&samples, Some(context)).ok()?;
+                let raw = crate::segment::join(&prev.raw, &segment);
+                let clean = crate::text::clean_whisper_text(&raw);
+                let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
+                    None
+                } else {
+                    pass.correct(&clean).and_then(Result::ok)
+                };
+                let shown = corrected.clone()
+                    .unwrap_or_else(|| crate::segment::join(&shown, &crate::text::clean_whisper_text(&segment)));
+                let pass = EarlyPass { raw, clean, corrected, until: Some(len), segments: prev.segments + 1 };
+                Some(Done { len, words, pass, shown })
+            })
+        } else {
+            let samples = audio.to_vec();
+            std::thread::spawn(move || {
+                let raw = pass.whisper(&samples).ok()?;
+                let clean = crate::text::clean_whisper_text(&raw);
+                let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
+                    None
+                } else {
+                    pass.correct(&clean).and_then(Result::ok)
+                };
+                let shown = corrected.clone().unwrap_or_else(|| clean.clone());
+                Some(Done { len, words, pass: EarlyPass { raw, clean, corrected, ..Default::default() }, shown })
+            })
+        };
+        let keep = !self.incremental || speech_end - self.cut() >= self.min_segment;
+        self.running = Some(Running { len, keep, thread });
         finished
     }
 
     /// Takes a finished pass; true if it produced a result.
     fn collect(&mut self) -> bool {
-        if !self.running.as_ref().is_some_and(|r| r.2.is_finished()) {
+        if !self.running.as_ref().is_some_and(|r| r.thread.is_finished()) {
             return false;
         }
-        let (len, words, h) = self.running.take().unwrap();
-        match h.join() {
-            Ok(Some(e)) => {
-                self.done = Some((len, words, e));
-                true
-            }
-            _ => false,
+        self.join()
+    }
+
+    /// Waits for the running pass, if any; true if it produced a result.
+    fn join(&mut self) -> bool {
+        let Some(r) = self.running.take() else { return false };
+        let Ok(Some(d)) = r.thread.join() else { return false };
+        if r.keep {
+            self.speculative = None;
+            self.done = Some(d);
+        } else {
+            self.speculative = Some(d);
+        }
+        true
+    }
+
+    /// The pass the preview shows: the speculative one when it is the latest.
+    fn latest(&self) -> Option<&Done> {
+        match (&self.done, &self.speculative) {
+            (Some(d), Some(s)) if d.len >= s.len => Some(d),
+            (_, Some(s)) => Some(s),
+            (d, None) => d.as_ref(),
         }
     }
 
     /// The preview: the latest pass's corrected text in place of the live
     /// words it covered, then the live words spoken since.
     fn preview(&self, committed: &str, tentative: &str) -> (String, String) {
-        let Some((_, words, e)) = &self.done else { return (committed.into(), tentative.into()) };
-        let fixed = e.corrected.as_deref().unwrap_or(&e.clean);
+        let Some(Done { words, shown, .. }) = self.latest() else { return (committed.into(), tentative.into()) };
         let c: Vec<&str> = committed.split_whitespace().collect();
         let t: Vec<&str> = tentative.split_whitespace().collect();
-        let mut out = fixed.to_string();
+        let mut out = shown.to_string();
         for w in c.iter().skip(*words) {
             out.push(' ');
             out.push_str(w);
@@ -383,24 +477,41 @@ impl EarlyWorker {
         (out, if tail.is_empty() { tail } else { format!(" {tail}") })
     }
 
-    /// The pass to use at stop: one covering all the speech, waiting for it
-    /// if it is still running.
+    /// The pass to use at stop. Whole mode: one covering all the speech,
+    /// waiting for it if it is still running. Incremental: the latest pass
+    /// (waiting for a running one, which started earlier than any pass
+    /// `stop` could start), speculative or kept: `until` is the clip's end
+    /// when no speech followed it, else `stop` recognizes the rest after the
+    /// kept segments.
     fn finish(mut self, log: &Path, audio: &[i16]) -> Option<EarlyPass> {
         let speech_end = self.speech_end.load(Ordering::SeqCst);
         let secs = |n: usize| n as f64 / RATE as f64;
         let t = Instant::now();
-        if let Some((len, words, h)) = self.running.take() {
-            if len >= speech_end {
-                if let Ok(Some(e)) = h.join() {
-                    self.done = Some((len, words, e));
-                }
-            }
+        if self.running.as_ref().is_some_and(|r| self.incremental || r.len >= speech_end) {
+            self.join();
         }
-        let used = self.done.filter(|(len, _, _)| *len >= speech_end && self.spoke).map(|(len, _, e)| (len, e));
+        let waited = t.elapsed().as_secs_f64() * 1000.0;
+        let used = if !self.spoke {
+            None
+        } else if self.incremental {
+            let ends = |d: &Done| speech_end <= d.len;
+            match (self.done.take(), self.speculative.take()) {
+                (_, Some(s)) if ends(&s) => Some((s.len, EarlyPass { until: Some(audio.len()), ..s.pass })),
+                (Some(d), _) => Some((d.len, EarlyPass { until: Some(if ends(&d) { audio.len() } else { d.len }), ..d.pass })),
+                (None, _) => None,
+            }
+        } else {
+            self.done.take().filter(|d| d.len >= speech_end).map(|d| (d.len, d.pass))
+        };
         if self.pass.is_some() && self.spoke {
             let what = match &used {
-                Some((len, e)) => format!("early pass used ({:.1} of {:.1} s, waited {:.0} ms, corrected {})",
-                    secs(*len), secs(audio.len()), t.elapsed().as_secs_f64() * 1000.0, e.corrected.is_some()),
+                Some((len, e)) if self.incremental => format!(
+                    "early segments used ({} covering {:.1} of {:.1} s, tail {}, waited {waited:.0} ms, corrected {})",
+                    e.segments, secs(*len), secs(audio.len()),
+                    if e.until == Some(audio.len()) { "silent".to_string() } else { format!("{:.1} s", secs(audio.len() - len)) },
+                    e.corrected.is_some()),
+                Some((len, e)) => format!("early pass used ({:.1} of {:.1} s, waited {waited:.0} ms, corrected {})",
+                    secs(*len), secs(audio.len()), e.corrected.is_some()),
                 None => format!("no early pass (speech until {:.1} of {:.1} s)", secs(speech_end), secs(audio.len())),
             };
             append_log(log, &format!("{} daemon: {what}", crate::history::local_iso_now()));
@@ -447,4 +558,224 @@ fn live_label(ctx: &Ctx) -> String {
 
 fn log_stdio(log: &Path) -> Stdio {
     std::fs::OpenOptions::new().create(true).append(true).open(log).map(Stdio::from).unwrap_or_else(|_| Stdio::null())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Per request: samples received and the prompt.
+    type Seen = Arc<Mutex<Vec<(usize, String)>>>;
+
+    /// A whisper-server stand-in answering `s0`, `s1`, ... after `delay_ms`.
+    fn fake_server(delay_ms: u64) -> (String, Seen) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 65536];
+                let head_end = loop {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                if head.contains("expect: 100-continue") {
+                    let _ = c.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                }
+                while buf.len() < head_end + len {
+                    let n = c.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body = &buf[head_end..];
+                let riff = body.windows(4).position(|w| w == b"RIFF").unwrap();
+                let data_len = u32::from_le_bytes(body[riff + 40..riff + 44].try_into().unwrap()) as usize;
+                let text = String::from_utf8_lossy(body);
+                let prompt = text.split("name=\"prompt\"\r\n\r\n").nth(1)
+                    .and_then(|p| p.split("\r\n--").next()).unwrap_or("").to_string();
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let mut seen = log.lock().unwrap();
+                let reply = format!("{{\"text\":\"s{}\"}}", seen.len());
+                seen.push((data_len / 2, prompt));
+                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+            }
+        });
+        (url, seen)
+    }
+
+    fn ctx(dir: &Path, server: &str, min_ms: u32) -> Ctx {
+        let mut env = crate::config::Env::with_vars([
+            ("DICTATE_SERVER".into(), server.into()),
+            ("DICTATE_PROMPT".into(), "Glossary.".into()),
+            ("DICTATE_SEGMENT_MIN_MS".into(), min_ms.to_string()),
+            ("DICTATE_MODEL".into(), dir.join("no-model.bin").to_string_lossy().into_owned()),
+        ]);
+        env.xdg_config_home = Some(dir.to_string_lossy().into_owned());
+        env.home = Some(dir.to_string_lossy().into_owned());
+        let cfg = crate::config::load_from_env(&env).unwrap();
+        let p = |n: &str| dir.join(n);
+        let paths = Paths {
+            rundir: dir.into(), datadir: dir.into(), state_dir: dir.into(), history_dir: p("h"), history_enabled: false,
+            pidfile: p("p"), startfile: p("st"), wav: p("w"), wav_proc: p("wp"), raw: p("r"), log: p("l"),
+            release_timing: p("rt"), preview_timing: p("pt"), preview_pidfile: p("pp"), modefile: p("m"),
+        };
+        Ctx::new(cfg, paths, false).unwrap()
+    }
+
+    fn tone(secs: f64) -> Vec<i16> {
+        (0..(secs * RATE as f64) as usize).map(|i| if i % 2 == 0 { 8000 } else { -8000 }).collect()
+    }
+
+    fn quiet(secs: f64) -> Vec<i16> {
+        vec![0; (secs * RATE as f64) as usize]
+    }
+
+    /// Feeds `audio[from..]` 160 ms at a time; `wait` joins each pass as soon
+    /// as it starts, as if recognition were instant.
+    fn feed(w: &mut EarlyWorker, audio: &[i16], from: usize, wait: bool) {
+        let mut len = from;
+        while len < audio.len() {
+            len = (len + crate::segment::CHUNK).min(audio.len());
+            w.heard(&audio[..len], "", "");
+            if wait {
+                w.join();
+            }
+        }
+    }
+
+    #[test]
+    fn segments_tile_the_recording() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, seen) = fake_server(0);
+        let ctx = ctx(tmp.path(), &url, 0);
+        let mut audio = tone(1.5);
+        audio.extend(quiet(1.0));
+        audio.extend(tone(2.0));
+        audio.extend(quiet(1.0));
+        audio.extend(tone(1.0));
+        audio.extend(quiet(0.2));
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio, 0, true);
+        let e = w.finish(&ctx.log, &audio).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(e.segments, 2);
+        assert_eq!(e.raw, "s0 s1");
+        let until = e.until.unwrap();
+        assert!(until < audio.len(), "speech after the last cut leaves a tail");
+        assert_eq!(seen.iter().map(|s| s.0).sum::<usize>(), until, "segments cover [0, until) once");
+        let at = |n: usize| n as f64 / RATE as f64;
+        assert!((1.5..2.5).contains(&at(seen[0].0)), "first cut in the first pause: {}", at(seen[0].0));
+        assert_eq!(seen[0].1, "Glossary.");
+        assert_eq!(seen[1].1, "Glossary. s0", "the previous text follows the prompt");
+    }
+
+    #[test]
+    fn silent_tail_needs_nothing_more() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, seen) = fake_server(0);
+        let ctx = ctx(tmp.path(), &url, 0);
+        let mut audio = tone(1.0);
+        audio.extend(quiet(0.8));
+        audio.extend(tone(1.0));
+        audio.extend(quiet(1.2));
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio, 0, true);
+        let e = w.finish(&ctx.log, &audio).unwrap();
+        assert_eq!(e.until, Some(audio.len()), "no speech after the last cut: nothing left for stop");
+        assert_eq!((e.segments, e.raw.as_str()), (2, "s0 s1"));
+        let sent: usize = seen.lock().unwrap().iter().map(|s| s.0).sum();
+        assert!(sent < audio.len() && sent > audio.len() - RATE as usize, "{sent}");
+    }
+
+    #[test]
+    fn speech_during_a_pass_goes_to_the_next() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, seen) = fake_server(300);
+        let ctx = ctx(tmp.path(), &url, 0);
+        let mut audio = tone(1.0);
+        audio.extend(quiet(0.8));
+        audio.extend(tone(1.0));
+        audio.extend(quiet(1.2));
+        audio.extend(tone(0.5));
+        // All of it arrives while the first pass runs: that pass keeps its
+        // cut, nothing else starts, and stop gets the rest as the tail.
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio, 0, false);
+        let e = w.finish(&ctx.log, &audio).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!((e.segments, e.raw.as_str()), (1, "s0"));
+        assert_eq!(e.until, Some(seen[0].0));
+        assert!(e.corrected.is_none());
+    }
+
+    #[test]
+    fn short_segments_are_speculative() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, seen) = fake_server(0);
+        let ctx = ctx(tmp.path(), &url, 2000);
+        let mut audio = tone(1.0);
+        audio.extend(quiet(0.8)); // 1 s of speech: speculative pass, dropped
+        audio.extend(tone(1.5));
+        audio.extend(quiet(0.8)); // 2.5 s since the start: kept
+        let kept = audio.len();
+        audio.extend(tone(1.0));
+        audio.extend(quiet(0.8)); // speculative again, and the end
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio[..kept], 0, true);
+        assert_eq!(w.done.as_ref().map(|d| d.pass.raw.as_str()), Some("s1"), "the kept segment replaces the speculative one");
+        let resumed = audio.len() - (0.8 * RATE as f64) as usize;
+        feed(&mut w, &audio[..resumed], kept, true);
+        // Stopping during speech: the kept segment, the rest is the tail.
+        let e = w.finish(&ctx.log, &audio[..resumed]).unwrap();
+        assert_eq!((e.raw.as_str(), e.until), ("s1", Some(seen.lock().unwrap()[1].0)));
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen[0].0 < seen[1].0, "the kept segment resends the speculative audio");
+    }
+
+    #[test]
+    fn speculative_pass_ends_the_dictation() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, _) = fake_server(0);
+        let ctx = ctx(tmp.path(), &url, 6000);
+        let mut audio = tone(1.0);
+        audio.extend(quiet(1.0));
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio, 0, true);
+        let e = w.finish(&ctx.log, &audio).unwrap();
+        assert_eq!((e.raw.as_str(), e.until, e.segments), ("s0", Some(audio.len()), 1));
+    }
+
+    #[test]
+    fn failed_segment_leaves_its_audio_to_stop() {
+        let _guard = crate::FAKE_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // Nothing listens here and whisper-cli has no model: every pass fails.
+        let ctx = ctx(tmp.path(), "http://127.0.0.1:9", 0);
+        let mut audio = tone(1.0);
+        audio.extend(quiet(1.0));
+        let mut w = EarlyWorker::new(&ctx);
+        feed(&mut w, &audio, 0, true);
+        assert!(w.finish(&ctx.log, &audio).is_none(), "no segment: stop recognizes the whole clip");
+    }
 }

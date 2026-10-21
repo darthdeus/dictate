@@ -114,7 +114,12 @@ With `dictate daemon` running, the live preview comes from the Nemotron
 streaming model (transcribe.cpp, `DICTATE_STREAM_MODEL`), and the final pass
 (whisper or `DICTATE_FINAL=elevenlabs`, then the optional `DICTATE_CORRECT`
 LLM correction) already runs during pauses, so a dictation that ends in a
-pause is ready on release. Without the daemon, `start`/`stop` record per
+pause is ready on release. Each pause pass recognizes only the audio since
+the previous pause (cut inside the silence, with the text so far as whisper
+context) and the correction runs on the whole text, so every second of audio
+is recognized once and release only has to recognize what followed the last
+pause. `DICTATE_INCREMENTAL=0` makes each pause pass resend the whole
+recording instead. Without the daemon, `start`/`stop` record per
 process with a whisper snapshot preview.
 
 The GTK overlay (`bin/dictate-overlay`, `lib/dictate-overlay/overlay.py`) is

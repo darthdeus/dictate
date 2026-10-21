@@ -4,8 +4,9 @@
 //! past), and every delivered dictation appends one to `metrics.jsonl`.
 //! `dictate stats [days]` summarizes both.
 //!
-//! Pause passes count: each one sends the whole recording so far, so a
-//! dictation with several pauses is billed for its audio several times.
+//! Pause passes count. With `DICTATE_INCREMENTAL=0` each one sends the whole
+//! recording so far, so a dictation with several pauses is billed for its
+//! audio several times; incrementally each second is sent once.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,12 @@ pub struct Dictation {
     pub recognizer_ms: Option<f64>,
     pub correction_ms: Option<f64>,
     pub paste_ms: Option<f64>,
+    /// Incremental final pass: pause segments recognized while recording,
+    /// and the seconds after the last one recognized at stop.
+    #[serde(default)]
+    pub segments: usize,
+    #[serde(default)]
+    pub tail_secs: Option<f64>,
 }
 
 /// Where a process records its API calls, and why it is calling.

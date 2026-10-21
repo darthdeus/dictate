@@ -39,6 +39,9 @@ pub struct Ctx {
     /// Release-timing TSV is written only inside `stop` (bash
     /// `RELEASE_TIMING_ACTIVE`); `retry`/`deliver` otherwise stay silent.
     pub timing_active: std::cell::Cell<bool>,
+    /// Set by an incremental `stop`: the daemon's pause segments used and
+    /// the seconds of audio after them recognized at stop (0: none).
+    pub tail: std::cell::Cell<Option<(usize, f64)>>,
 }
 
 impl Ctx {
@@ -65,6 +68,7 @@ impl Ctx {
             history,
             command_started: now_unix(),
             timing_active: std::cell::Cell::new(false),
+            tail: std::cell::Cell::new(None),
         })
     }
 
@@ -757,11 +761,20 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
     // Rows of "label\tvalue\tunit" for the card's table; a line without tabs is a note.
     let mut parts = vec![format!("total\t{:.2}\ts", now_unix() - ctx.command_started)];
+    let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
+    let tail = ctx.tail.get();
     if at("early_pass_used").is_some() {
         parts.push("final pass\tin pause\t".into());
     } else if let Some(ms) = span("transcription_started", "transcription_finished") {
-        let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
-        parts.push(format!("{engine}\t{:.2}\ts", ms / 1000.0));
+        // Incremental: only the audio after the last pause was left to recognize.
+        let label = if tail.is_some() { format!("{engine} tail") } else { engine.to_string() };
+        parts.push(format!("{label}\t{:.2}\ts", ms / 1000.0));
+    }
+    if let Some((segments, secs)) = tail {
+        parts.push(format!("pause segments\t{segments}\t"));
+        if secs > 0.0 {
+            parts.push(format!("tail audio\t{secs:.1}\ts"));
+        }
     }
     if let Some(ms) = span("correction_started", "correction_finished") {
         parts.push(format!("correction\t{:.2}\ts", ms / 1000.0));
@@ -780,6 +793,8 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
         recognizer_ms: at("early_pass_used").is_none().then(|| span("transcription_started", "transcription_finished")).flatten(),
         correction_ms: at("early_pass_used").is_none().then(|| span("correction_started", "correction_finished")).flatten(),
         paste_ms: span("text_ready", "delivery_returned"),
+        segments: tail.map_or(0, |t| t.0),
+        tail_secs: tail.map(|t| t.1),
     });
     // One stage per line: the card shows only these, so they must be readable at a glance.
     let mut stats = parts.join("\n");
@@ -845,9 +860,28 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str, e
         ctx.history.set_status(e, "transcribing");
     }
     ctx.mark("transcription_started");
+    // Incremental: the daemon's segments end at `until`; only the rest of
+    // the clip is recognized now, with their text as context.
+    let tail = early.as_ref().and_then(|e| Some((e.until?, wav::read_mono16(&feed).ok()?)))
+        .filter(|(until, samples)| until < &samples.len());
     let raw_text = match (&early, ctx.engine()) {
+        (Some(e), _) if tail.is_some() => {
+            let (until, samples) = tail.unwrap();
+            ctx.mark("early_segments_used");
+            ctx.tail.set(Some((e.segments, (samples.len() - until) as f64 / wav::RATE as f64)));
+            let context = e.corrected.as_deref().unwrap_or(&e.clean);
+            match pass.recognize(&samples[until..], Some(context)) {
+                Ok(t) => Ok(crate::segment::join(&e.raw, &t)),
+                Err(err) => {
+                    append_log(&ctx.log, &format!("note: tail pass failed, recognizing the whole clip: {err:#}"));
+                    ctx.tail.set(None);
+                    pass.whisper(&samples)
+                }
+            }
+        }
         (Some(e), _) => {
             ctx.mark("early_pass_used");
+            ctx.tail.set((e.segments > 0).then_some((e.segments, 0.0)));
             Ok(e.raw.clone())
         }
         (None, Engine::Parakeet) => {
@@ -955,15 +989,23 @@ pub struct FinalPass {
     min_peak: f64,
 }
 
-/// A final pass the daemon finished during a pause that turned out to be
-/// the end of the dictation.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// What the daemon recognized during the pauses: the whole dictation when
+/// the last pause was its end, or (`DICTATE_INCREMENTAL`) the segments
+/// before the last cut, leaving `stop` only the audio after `until`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct EarlyPass {
     pub raw: String,
     /// The correction of `clean`, used only if the final text still matches
     /// `clean` when correction comes up (nothing rewrote it in between).
     pub clean: String,
     pub corrected: Option<String>,
+    /// Samples covered: `None` (or the clip length) when the pass covers the
+    /// whole clip, else `stop` recognizes `samples[until..]` and appends it.
+    #[serde(default)]
+    pub until: Option<usize>,
+    /// Pause segments recognized (incremental passes only).
+    #[serde(default)]
+    pub segments: usize,
 }
 
 impl FinalPass {
@@ -1004,6 +1046,15 @@ impl FinalPass {
     /// at pauses (see `wav::WHISPER_PIECE_SECS`), and silent pieces are
     /// skipped: whisper invents "Thank you." for silence.
     pub fn whisper(&self, samples: &[i16]) -> Result<String> {
+        self.recognize(samples, None)
+    }
+
+    /// `whisper`, for a segment of a longer recording when `context` is
+    /// given: the text recognized before it goes after whisper's prompt, and
+    /// each piece of a long segment gets the pieces before it the same way,
+    /// so sentences carry across the joins. ElevenLabs takes no such
+    /// context, only the glossary as keyterms.
+    pub fn recognize(&self, samples: &[i16], context: Option<&str>) -> Result<String> {
         match &self.scribe {
             Some(Ok(scribe)) => match scribe.transcribe(samples) {
                 Ok(text) => return Ok(text),
@@ -1016,7 +1067,7 @@ impl FinalPass {
         static PIECE: AtomicU64 = AtomicU64::new(0);
         let pieces = wav::split_at_pauses(samples, wav::WHISPER_PIECE_SECS);
         let single = pieces.len() == 1;
-        let mut texts = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
         for range in pieces {
             if !single && is_silence(Some(wav::peak_db(&samples[range.clone()])), self.min_peak) {
                 continue;
@@ -1024,7 +1075,17 @@ impl FinalPass {
             let n = PIECE.fetch_add(1, Ordering::Relaxed);
             let piece = self.scratch.join(format!("dictate-piece-{}-{n}.wav", std::process::id()));
             wav::write_mono16(&piece, &samples[range])?;
-            let text = transcribe::transcribe_whisper(&piece, &self.whisper, &self.log);
+            let text = match context {
+                None => transcribe::transcribe_whisper(&piece, &self.whisper, &self.log),
+                Some(before) => {
+                    let before = texts.iter().fold(before.to_string(), |a, t| crate::segment::join(&a, &text::clean_whisper_text(t)));
+                    let cfg = WhisperConfig {
+                        prompt: crate::segment::prompt_with_context(&self.whisper.prompt, &before),
+                        ..self.whisper.clone()
+                    };
+                    transcribe::transcribe_whisper(&piece, &cfg, &self.log)
+                }
+            };
             let _ = std::fs::remove_file(&piece);
             texts.push(text?);
         }
@@ -1806,6 +1867,65 @@ pub fn cmd_bench(ctx: &Ctx, wav: Option<&str>) -> Result<()> {
     }
     println!("\n  Note: these run through whisper-cli, but dictation runs through");
     println!("  whisper-cli and whisper-server can differ on the same audio.");
+    Ok(())
+}
+
+/// `dictate segbench <wav>...`: whisper on each whole clip against whisper on
+/// the segments the daemon would cut at its pauses (`segment::simulate_cuts`),
+/// without and with the previous text as context. Word errors are counted
+/// against the clip's reference: `transcript.elevenlabs.txt` beside it, else
+/// `transcript.corrected.txt`, else `transcript.txt`, else `<clip>.txt`. Prints one TSV row per clip
+/// and the totals; `-v` also prints the texts.
+pub fn cmd_segbench(ctx: &Ctx, wavs: &[PathBuf], verbose: bool) -> Result<()> {
+    use crate::correct::{edit_distance, words};
+    let pass = FinalPass::new(ctx, "bench");
+    let level: f32 = ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0);
+    let ms = |key: &str, default: &str| ctx.c(key, default).parse::<usize>().unwrap_or(default.parse().unwrap()) * wav::RATE as usize / 1000;
+    let pause = ms("DICTATE_EARLY_PAUSE_MS", "500");
+    let min = ms("DICTATE_SEGMENT_MIN_MS", crate::segment::MIN_SEGMENT_MS);
+    let mut total = [0usize; 4];
+    println!("clip\tsecs\tsegments\tref_words\twhole\tsegmented\tsegmented+context");
+    for path in wavs {
+        let samples = wav::read_mono16(path).with_context(|| format!("reading {}", path.display()))?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let reference = ["transcript.elevenlabs.txt", "transcript.corrected.txt", "transcript.txt"].iter()
+            .map(|n| dir.join(n))
+            .chain([path.with_extension("txt")])
+            .find_map(|p| std::fs::read_to_string(p).ok());
+        let Some(reference) = reference else {
+            eprintln!("{}: no reference transcript, skipped", path.display());
+            continue;
+        };
+        let mut bounds = vec![0];
+        bounds.extend(crate::segment::simulate_cuts(&samples, level, pause, min));
+        let tail_speech = wav::peak_db(&samples[*bounds.last().unwrap()..]) >= level;
+        if tail_speech || bounds.len() == 1 {
+            bounds.push(samples.len());
+        }
+        let whole = text::clean_whisper_text(&pass.whisper(&samples)?);
+        let (mut plain, mut chained) = (String::new(), String::new());
+        for w in bounds.windows(2) {
+            let seg = &samples[w[0]..w[1]];
+            plain = crate::segment::join(&plain, &text::clean_whisper_text(&pass.recognize(seg, None)?));
+            let next = text::clean_whisper_text(&pass.recognize(seg, Some(&chained))?);
+            chained = crate::segment::join(&chained, &next);
+        }
+        let r = words(&reference);
+        let err = |t: &str| edit_distance(&r, &words(t));
+        let (e0, e1, e2) = (err(&whole), err(&plain), err(&chained));
+        let name = if path.file_name().is_some_and(|n| n == "audio.wav") { dir } else { path.as_path() };
+        println!("{}\t{:.1}\t{}\t{}\t{e0}\t{e1}\t{e2}", name.file_name().unwrap_or_default().to_string_lossy(),
+            samples.len() as f64 / wav::RATE as f64, bounds.len() - 1, r.len());
+        if verbose {
+            println!("  ref:     {}\n  whole:   {whole}\n  seg:     {plain}\n  seg+ctx: {chained}", reference.trim());
+        }
+        for (t, v) in total.iter_mut().zip([r.len(), e0, e1, e2]) {
+            *t += v;
+        }
+    }
+    let pct = |e: usize| 100.0 * e as f64 / total[0].max(1) as f64;
+    println!("total\t\t\t{}\t{} ({:.2}%)\t{} ({:.2}%)\t{} ({:.2}%)", total[0],
+        total[1], pct(total[1]), total[2], pct(total[2]), total[3], pct(total[3]));
     Ok(())
 }
 
