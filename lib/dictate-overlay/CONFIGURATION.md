@@ -65,6 +65,4 @@ or containing multipart syntax remain literal text.
 Both settings are recognition hints, not guaranteed corrections. Personal terms
 belong in the user's private profile, not in application defaults or tests.
 
-Run `python3 lib/dictate-overlay/check_config.py` for configuration checks and
-`python3 lib/dictate-overlay/check_transcription.py` for request forwarding
-checks.
+`cargo test` covers configuration parsing and request forwarding.

@@ -9,8 +9,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Every `DICTATE_*` key the application understands. Must stay in sync with
-/// `config.py::KNOWN` until the Python loader is retired.
+/// Every `DICTATE_*` key the application understands.
 pub fn known_keys() -> HashSet<&'static str> {
     [
         "DICTATE_CHAN",

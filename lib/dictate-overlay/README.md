@@ -39,7 +39,7 @@ Gdk.Window input shape was insufficient: GTK overwrote it when showing the
 window. Clicks and pointer movement pass to the underlying application. The
 existing i3 rules remain useful for the optional legacy feh backend.
 
-`bin/dictate` atomically writes a private JSON state file in the runtime
+`dictate` atomically writes a private JSON state file in the runtime
 directory. A singleton renderer handles animation and expiration, stays warm
 for 60 seconds after hiding, and reuses its window. No transcript update waits
 for image generation or animation. The first launch builds a small cached Nix
@@ -85,8 +85,8 @@ Requests never overlap, even with zero pause. Actual cadence includes all
 processing and bookkeeping, so zero pause does not mean zero latency. For
 further gains, use real-session timings to identify the bottleneck.
 
-Run `python3 lib/dictate-overlay/check_preview.py` to check cadence, stage
-accounting, error recovery, and timing summaries without recording or inference.
+`cargo test` checks preview cadence, stage accounting, error recovery, and
+timing summaries without recording or inference.
 
 Preview silence gating uses the existing raw capture, not a speech model. A
 small persistent helper checks newly recorded audio in 20 ms blocks on the

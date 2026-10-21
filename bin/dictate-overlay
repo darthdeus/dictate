@@ -11,9 +11,8 @@ script=overlay.py
 lock=renderer.lock
 case "${1:-}" in
   --check) script=check.py; lock=check.lock ;;
-  --check-delivery) script=check_delivery.py; lock=check-delivery.lock ;;
   "") ;;
-  *) echo "usage: dictate-overlay [--check|--check-delivery]" >&2; exit 1 ;;
+  *) echo "usage: dictate-overlay [--check]" >&2; exit 1 ;;
 esac
 exec 9>"$state_dir/$lock"
 flock -n 9 || exit 0

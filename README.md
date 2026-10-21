@@ -58,10 +58,14 @@ local environment or configuration file.
 ```sh
 git clone <repository-url> dictate
 cd dictate
-chmod +x bin/dictate bin/dictate-overlay
+cargo build --release          # binary: target/release/dictate
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/dictate"
 cp config.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/dictate/config.toml"
 ```
+
+`shell.nix` provides the toolchain (Rust, CMake, Vulkan headers and shader
+compiler for the transcribe.cpp streaming engine): `nix-shell --run 'cargo
+build --release'`.
 
 Install Whisper.cpp and a model separately. The upstream project documents the
 same build and model-download flow in its [README](https://github.com/ggml-org/whisper.cpp/blob/master/README.md):
@@ -81,7 +85,7 @@ set `DICTATE_MODEL` in the environment or in the local configuration.
 Edit the copied configuration locally, then run:
 
 ```sh
-bin/dictate doctor
+target/release/dictate doctor
 ```
 
 Set `DICTATE_CONFIG=/path/to/config.toml` to use another profile. Set
@@ -90,12 +94,15 @@ Set `DICTATE_CONFIG=/path/to/config.toml` to use another profile. Set
 ## Usage
 
 ```sh
-bin/dictate start       # begin capture
-bin/dictate stop        # transcribe and deliver
-bin/dictate toggle      # start or stop
-bin/dictate demo        # show the overlay without recording
-bin/dictate history     # list recoverable dictations
-bin/dictate retry latest
+dictate start       # begin capture
+dictate stop        # transcribe and deliver
+dictate toggle      # start or stop
+dictate daemon      # resident streaming engine (live preview, pause pass)
+dictate serve       # resident whisper server
+dictate demo        # show the overlay without recording
+dictate history     # list recoverable dictations
+dictate retry latest
+dictate replay 50   # re-run saved recordings through the text path, read-only
 ```
 
 Bind `start` and `stop` to a press/release key in the desktop environment of
@@ -103,63 +110,31 @@ your choice. The keyd → sxhkd → F19 chain is one example integration, not a
 requirement; any input tool that invokes `start` on press and `stop` on release
 can be used. The overlay is designed not to take focus or intercept clicks.
 
-The default GTK overlay is built on first use. If Nix or the `<nixpkgs>`
-channel is unavailable, `dictate-overlay` reports the failure once through the
-desktop notification system when available and records it in the private state
-log. `DICTATE_OSD_BACKEND=feh` is a legacy alternative; it requires `feh`,
-ImageMagick, and a window-manager rule that keeps the `dictate-osd` window
-unfocused, floating, and borderless.
+With `dictate daemon` running, the live preview comes from the Nemotron
+streaming model (transcribe.cpp, `DICTATE_STREAM_MODEL`), and the final pass
+(whisper or `DICTATE_FINAL=elevenlabs`, then the optional `DICTATE_CORRECT`
+LLM correction) already runs during pauses, so a dictation that ends in a
+pause is ready on release. Without the daemon, `start`/`stop` record per
+process with a whisper snapshot preview.
+
+The GTK overlay (`bin/dictate-overlay`, `lib/dictate-overlay/overlay.py`) is
+built on first use. If Nix or the `<nixpkgs>` channel is unavailable, it
+reports the failure once through the desktop notification system when
+available and records it in the private state log.
+`DICTATE_OSD_BACKEND=feh` disables the panel (text is still delivered).
 
 ## Checks
 
 ```sh
-python3 lib/dictate-overlay/check_config.py
-python3 lib/dictate-overlay/check_transcription.py
-python3 lib/dictate-overlay/check_preview.py
-bin/dictate-overlay --check
-bin/dictate-overlay --check-delivery
-bash -n bin/dictate bin/dictate-overlay
+cargo test                                  # unit tests
+cargo clippy --all-targets -- -D warnings   # must stay warning-free
+bin/dictate-overlay --check                 # isolated overlay/focus/input tests
+cargo run --release -- replay 50            # end-to-end text path over saved history
 ```
 
 These checks do not replace a real dictation [smoke test](docs/smoke-test.md)
 in the target applications. See [`lib/dictate-overlay/README.md`](lib/dictate-overlay/README.md)
-for overlay, preview, timing, and delivery details.
-
-## Rust port (`src/`)
-
-A native port lives alongside the reference Bash implementation. Same
-subcommands (`cargo run -- <start|stop|toggle|demo|timings|doctor|level|
-meter|serve|scan|bench|history|show|retry>`), same config precedence, same
-history/timing file formats — both binaries read the same state directories,
-so they interoperate entry by entry.
-
-The port adds `dictate replay [n]`: the newest `n` saved recordings go back
-through the same audio → text path as `stop` (read-only — no history writes,
-overlay, or delivery) and are compared with the transcripts saved at the
-time. On unchanged configuration every entry should be identical, which makes
-it an end-to-end regression check against your own history, including
-entries recorded by `bin/dictate`. It needs the transcription server (or
-`whisper-cli`) and does not exercise capture, preview, or delivery; those are
-covered by the [smoke test](docs/smoke-test.md).
-
-Phase 1 shells out to the same backends (`pw-record`/`ffmpeg`,
-`whisper-cli`/`whisper-server`, `xdotool`, `xclip`/`copyq`); platform code
-is isolated behind traits (`audio`, `overlay`, `delivery`, `transcribe`) for
-a native phase 2. The overlay JSON protocol is unchanged, so the current
-GTK renderer keeps working.
-
-Differences from `bin/dictate` (all under `DICTATE_OSD_BACKEND=feh` are
-bash-only):
-
-- Overlay: GTK only. With `DICTATE_OSD_BACKEND=feh` text is still delivered
-  and `state.json` still published, but no panel is spawned; `doctor`
-  reports the setting as a warning, not a requirement for `feh`/`magick`.
-
-```sh
-cargo test                          # unit tests (config, gates, delivery, timing, history, text)
-cargo clippy --all-targets -- -D warnings   # must stay warning-free
-cargo run --release -- replay 50    # end-to-end text path over saved history
-```
+for overlay details.
 
 ## License
 

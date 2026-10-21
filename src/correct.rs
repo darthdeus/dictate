@@ -143,9 +143,7 @@ pub fn words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for (i, &c) in t.iter().enumerate() {
-        if alnum(c) {
-            cur.push(c);
-        } else if (c == '.' || c == '\'') && !cur.is_empty() && t.get(i + 1).is_some_and(|&n| alnum(n)) {
+        if alnum(c) || ((c == '.' || c == '\'') && !cur.is_empty() && t.get(i + 1).is_some_and(|&n| alnum(n))) {
             cur.push(c);
         } else if !cur.is_empty() {
             out.push(std::mem::take(&mut cur));

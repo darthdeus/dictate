@@ -82,8 +82,11 @@ struct Recording {
     stop: Arc<AtomicBool>,
     wav: PathBuf,
     early_path: PathBuf,
-    thread: JoinHandle<(Session, Result<(Vec<i16>, Option<EarlyPass>)>)>,
+    thread: JoinHandle<(Session, Result<Captured>)>,
 }
+
+/// The clip, and the pause pass that covers it if one finished.
+type Captured = (Vec<i16>, Option<EarlyPass>);
 
 /// `dictate daemon`: serve until killed. `load_ctx` is called per recording,
 /// so config edits apply to the next dictation without a restart.
@@ -220,7 +223,7 @@ fn stop(r: Recording) -> (Session, String) {
 /// Reads the recorder until EOF (stop) or `DICTATE_MAX_SECS`, feeding the
 /// model 160 ms at a time and publishing each change of the preview.
 fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, chan: usize, stop: &AtomicBool)
-    -> Result<(Vec<i16>, Option<EarlyPass>)> {
+    -> Result<Captured> {
     let mut out = child.stdout.take().context("recorder has no stdout")?;
     let frame = channels * 2;
     let chunk_bytes = RATE as usize * CHUNK_MS / 1000 * frame;
