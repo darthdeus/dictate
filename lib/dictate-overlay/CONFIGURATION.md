@@ -66,3 +66,23 @@ Both settings are recognition hints, not guaranteed corrections. Personal terms
 belong in the user's private profile, not in application defaults or tests.
 
 `cargo test` covers configuration parsing and request forwarding.
+
+### Live preview phrase boost
+
+With `dictate daemon` running, the live preview comes from the Nemotron
+streaming model (`DICTATE_STREAM_MODEL`, lookahead `DICTATE_STREAM_RIGHT`).
+Its decoder is biased towards glossary terms (transcribe.cpp phrase
+boosting: a logit bonus along each term's token path), so names such as
+`NixOS` or `AGENTS.md` show up spelled right while you speak. It affects the
+preview only; the final text still comes from the final pass.
+
+- `DICTATE_PREVIEW_BOOST`: boost weight, default `2`. `0` or `false` turns
+  boosting off. Higher weights fix more terms but rewrite more unrelated
+  words.
+- `DICTATE_PREVIEW_TERMS`: comma-separated terms to boost, used as is. When
+  unset, the preview boosts `DICTATE_TERMS` minus terms of three characters
+  or fewer (`AI`, `GPU`) and common English or everyday developer words
+  (`master`, `prompt`, `diff`): boosting those mostly turns unrelated speech
+  into the term. Multi-word phrases are always kept.
+- `DICTATE_PREVIEW_STOP`: extra comma-separated terms (case-insensitive) to
+  leave out of that default list, for personal terms that misfire.

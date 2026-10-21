@@ -771,7 +771,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "transcribe-cpp"
 version = "0.4.0"
-source = "git+https://github.com/handy-computer/transcribe.cpp?rev=db678a031cf4c524bcab2c45a0dc6a7813106e4a#db678a031cf4c524bcab2c45a0dc6a7813106e4a"
+source = "git+file:///home/darth/projects/transcribe.cpp?rev=6c24521cb008be10adee292107004eea96a83c95#6c24521cb008be10adee292107004eea96a83c95"
 dependencies = [
  "log",
  "thiserror 2.0.21",
@@ -781,7 +781,7 @@ dependencies = [
 [[package]]
 name = "transcribe-cpp-sys"
 version = "0.4.0"
-source = "git+https://github.com/handy-computer/transcribe.cpp?rev=db678a031cf4c524bcab2c45a0dc6a7813106e4a#db678a031cf4c524bcab2c45a0dc6a7813106e4a"
+source = "git+file:///home/darth/projects/transcribe.cpp?rev=6c24521cb008be10adee292107004eea96a83c95#6c24521cb008be10adee292107004eea96a83c95"
 dependencies = [
  "cmake",
  "serde_json",

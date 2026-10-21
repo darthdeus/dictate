@@ -21,7 +21,10 @@ anyhow = "1"
 thiserror = "1"
 serde_json = "1"
 # Streaming preview engine (Nemotron). Pinned: the bindings are pre-1.0.
-transcribe-cpp = { git = "https://github.com/handy-computer/transcribe.cpp", rev = "db678a031cf4c524bcab2c45a0dc6a7813106e4a", default-features = false, features = ["vulkan"] }
+# 6c24521 is the local-only `phrase-boost` branch (glossary phrase boosting,
+# ParakeetStreamOptions::vocabulary_boost) in ~/projects/transcribe.cpp.
+# Push it to a reachable remote and point `git` there before packaging.
+transcribe-cpp = { git = "file:///home/darth/projects/transcribe.cpp", rev = "6c24521cb008be10adee292107004eea96a83c95", default-features = false, features = ["vulkan"] }
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
