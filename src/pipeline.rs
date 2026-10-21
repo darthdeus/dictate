@@ -684,6 +684,57 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
         }
         notify_done(ctx, "Pasted", &text, entry.as_deref(), dur);
     }
+    if let Some(e) = &entry {
+        spawn_shadow(ctx, e);
+    }
+    Ok(())
+}
+
+/// Shadow labelling (`DICTATE_SHADOW=1`, only while the final pass is local):
+/// after the paste, a detached `dictate shadow <entry>` sends the audio to
+/// ElevenLabs once, Qwen-corrected like a final pass, and saves it as
+/// `transcript.elevenlabs.txt` next to the dictation. That gives fine-tuning
+/// labels from a better model and, in `dictate stats`, how often it would
+/// have pasted something else. Spending stops at `DICTATE_SHADOW_MAX_MIN`
+/// minutes of audio in total.
+fn spawn_shadow(ctx: &Ctx, entry: &Path) {
+    if ctx.c("DICTATE_SHADOW", "0") != "1" || ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" {
+        return;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dictate"));
+    let _ = std::process::Command::new(exe)
+        .arg("shadow")
+        .arg(entry)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+pub fn run_shadow(ctx: &Ctx, entry: &Path) -> Result<()> {
+    let max_min: f64 = ctx.c("DICTATE_SHADOW_MAX_MIN", "360").parse().unwrap_or(360.0);
+    let used = crate::usage::audio_minutes(&ctx.state_dir(), "shadow");
+    if used >= max_min {
+        append_log(&ctx.log, &format!("shadow: budget used ({used:.0} of {max_min:.0} min), skipping"));
+        return Ok(());
+    }
+    let samples = wav::read_mono16(&entry.join("audio.wav"))?;
+    let meter = crate::usage::Meter::new(&ctx.state_dir(), &ctx.cfg, "shadow");
+    let mut scribe = crate::elevenlabs::Scribe::from_config(&ctx.cfg, &ctx.terms())?;
+    scribe.meter = Some(meter.clone());
+    let raw = match scribe.transcribe(&samples) {
+        Ok(t) => t,
+        Err(e) => {
+            append_log(&ctx.log, &format!("shadow: elevenlabs failed: {e:#}"));
+            return Ok(());
+        }
+    };
+    let text = Corrector::from_config(&ctx.cfg, &ctx.terms())
+        .map(|c| Corrector { meter: Some(meter), ..c })
+        .and_then(|c| c.correct(&raw))
+        .unwrap_or_else(|_| raw.clone());
+    std::fs::write(entry.join("transcript.elevenlabs.raw.txt"), format!("{raw}\n"))?;
+    std::fs::write(entry.join("transcript.elevenlabs.txt"), format!("{text}\n"))?;
     Ok(())
 }
 

@@ -83,6 +83,35 @@ impl Meter {
     }
 }
 
+/// Minutes of audio sent for `purpose` so far, all time (the shadow budget).
+pub fn audio_minutes(state_dir: &Path, purpose: &str) -> f64 {
+    read(&state_dir.join("usage.jsonl"), 0.0, |c: &ApiCall| c.ts).iter()
+        .filter(|c: &&ApiCall| c.purpose == purpose)
+        .map(|c| c.audio_secs).sum::<f64>() / 60.0
+}
+
+/// Shadow labels against what was pasted: (dictations, identical, words, words differing).
+fn shadow_agreement(state_dir: &Path, since: f64) -> (usize, usize, usize, usize) {
+    let mut out = (0, 0, 0, 0);
+    let Ok(dirs) = std::fs::read_dir(state_dir.join("history")) else { return out };
+    for d in dirs.flatten().map(|d| d.path()) {
+        let read = |n: &str| std::fs::read_to_string(d.join(n)).ok();
+        let (Some(shadow), Some(pasted)) = (read("transcript.elevenlabs.txt"), read("transcript.txt")) else { continue };
+        let fresh = std::fs::metadata(d.join("transcript.elevenlabs.txt")).and_then(|m| m.modified()).ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).is_some_and(|t| t.as_secs_f64() >= since);
+        if !fresh {
+            continue;
+        }
+        let (a, b) = (crate::correct::words(&shadow), crate::correct::words(&pasted));
+        let diff = crate::correct::edit_distance(&a, &b);
+        out.0 += 1;
+        out.1 += usize::from(diff == 0);
+        out.2 += a.len();
+        out.3 += diff;
+    }
+    out
+}
+
 pub fn record_dictation(state_dir: &Path, d: &Dictation) {
     append(&state_dir.join("metrics.jsonl"), d);
 }
@@ -154,6 +183,12 @@ pub fn summarize(state_dir: &Path, days: f64) -> Result<String> {
         out += &format!("{setup:<w$} {:>4}  {:>7}/{:<7}  {:>14}  {:>14}  {:>9}  {:>4}/{}\n", ds.len(),
             ms(pct(ds.iter().map(|d| d.total_ms).collect(), 0.5)), ms(pct(ds.iter().map(|d| d.total_ms).collect(), 0.9)),
             ms(col(|d| d.recognizer_ms)), ms(col(|d| d.correction_ms)), ms(col(|d| d.paste_ms)), early, ds.len());
+    }
+    let (n, same, words, diff) = shadow_agreement(state_dir, since);
+    if n > 0 {
+        out += &format!("\nElevenLabs shadow labels: {n} dictations, {same} identical to what was pasted, \
+            {diff} of {words} words differ ({:.1}%); budget used {:.0} min\n",
+            100.0 * diff as f64 / words.max(1) as f64, audio_minutes(state_dir, "shadow"));
     }
     out += "\n(recognizer/correction times exclude dictations finished during a pause; paid\n\
             requests include pause passes whose text was later replaced)\n";

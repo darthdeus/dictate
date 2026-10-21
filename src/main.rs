@@ -83,6 +83,9 @@ enum Command {
     /// Hidden: live-preview scheduler (spawned by `start`)
     #[command(hide = true)]
     PreviewWorker,
+    /// Hidden: ElevenLabs shadow label for one history entry (spawned by `stop`)
+    #[command(hide = true)]
+    Shadow { entry: std::path::PathBuf },
     /// Hidden: clipboard restore worker (spawned detached by `stop`/`retry`)
     #[command(hide = true)]
     RestoreClipboard {
@@ -110,6 +113,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::PreviewWorker => return pipeline::run_preview_worker(&ctx()?),
+        Command::Shadow { entry } => return pipeline::run_shadow(&ctx()?, &entry),
         Command::RestoreClipboard { backend, settle_secs, expected_path, prev_path, xclip_bin, copyq_bin } => {
             dictate_lib::delivery::run_restore_worker(
                 &backend,
