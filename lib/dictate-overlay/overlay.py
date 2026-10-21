@@ -48,7 +48,19 @@ COMPACT_W = 480
 # The success card shows only how the dictation went (the text is already
 # pasted), large enough to read at a glance.
 STATS_SIZE = 22
-FOOT_SIZE = 15
+LABEL_SIZE = 17
+FOOT_SIZE = 14
+ROW_H = 34
+DIM = (0.48, 0.54, 0.62)
+BRIGHT = (0.89, 0.92, 0.96)
+
+
+def card_rows(state):
+    """Stats lines "label<TAB>value<TAB>unit" become table rows; others are notes."""
+    lines = state.get("stats", "").splitlines()
+    rows = [line.split("\t")+["", ""] for line in lines if "\t" in line]
+    notes = [line for line in lines if line and "\t" not in line]
+    return [r[:3] for r in rows], notes
 
 
 def card_text(state):
@@ -158,8 +170,46 @@ class Overlay(Gtk.Window):
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         return layout.get_pixel_size()[1]
 
-    def card_foot(self):
-        return self.state.get("stats", "")
+    def card_note(self, notes):
+        return "\n".join(notes+[self.state.get("engine", "")]).strip()
+
+    def span(self, text, size, bold=False):
+        layout = self.area.create_pango_layout(text)
+        font = Pango.FontDescription()
+        font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
+        font.set_absolute_size(size*Pango.SCALE)
+        font.set_weight(Pango.Weight.BOLD if bold else Pango.Weight.NORMAL)
+        layout.set_font_description(font)
+        return layout
+
+    def draw_rows(self, cr, rows, y, accent):
+        """Labels left, numbers right-aligned in one column, units after them."""
+        if not rows:
+            return y
+        labels = [self.span(r[0], LABEL_SIZE) for r in rows]
+        values = [self.span(r[1], STATS_SIZE, bold=True) for r in rows]
+        units = [self.span(r[2], LABEL_SIZE) for r in rows]
+        label_w = max(l.get_pixel_size()[0] for l in labels)
+        value_w = max(v.get_pixel_size()[0] for v in values)
+        right = 32 + label_w + 28 + value_w
+        for i, (label, value, unit) in enumerate(zip(labels, values, units)):
+            row_y = y + i*ROW_H
+            vw, vh = value.get_pixel_size()
+            lh = label.get_pixel_size()[1]
+            base = row_y + vh  # align label/unit baseline-ish with the number
+            for layout, x, top, color in ((label, 32, base-lh-1, DIM),
+                                          (value, right-vw, row_y, accent if i == 0 else BRIGHT),
+                                          (unit, right+7, base-lh-1, DIM)):
+                cr.set_source_rgb(*color)
+                cr.move_to(x, top)
+                PangoCairo.show_layout(cr, layout)
+            if i == 0 and len(rows) > 1:
+                cr.set_source_rgba(*DIM, 0.35)
+                cr.set_line_width(1)
+                cr.move_to(32, row_y + ROW_H - 3)
+                cr.line_to(self.w-32, row_y + ROW_H - 3)
+                cr.stroke()
+        return y + len(rows)*ROW_H
 
     def fit_text(self, reset=False):
         small = compact(self.state)
@@ -172,11 +222,11 @@ class Overlay(Gtk.Window):
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         _, text_height = layout.get_pixel_size()
         if small:
-            foot = self.measure(self.card_foot(), STATS_SIZE)
+            rows, notes = card_rows(self.state)
+            foot = len(rows)*ROW_H
+            foot += self.measure(self.card_note(notes), FOOT_SIZE)+14 if self.card_note(notes) else 0
             if not card_text(self.state):
                 text_height = 0
-            engine = self.state.get("engine", "")
-            foot += self.measure(engine, FOOT_SIZE)+6 if engine else 0
             desired = min(int(self.monitor_rect.height*0.5), text_height + foot + 86)
             self.target_h = desired
             self.y = self.base_y
@@ -316,16 +366,15 @@ class Overlay(Gtk.Window):
         cr.arc(37, 33, 5, 0, math.tau)
         cr.fill()
         self.text(cr, self.state.get("label", "Ready").upper(), 54, 21, 15, accent, self.w-90, bold=True)
-        foot = self.card_foot()
-        foot_h = self.measure(foot, STATS_SIZE)
-        engine = self.state.get("engine", "")
-        engine_h = self.measure(engine, FOOT_SIZE) if engine else 0
+        rows, notes = card_rows(self.state)
+        note = self.card_note(notes)
+        note_h = self.measure(note, FOOT_SIZE) if note else 0
         body = card_text(self.state)
         if body:
-            self.text(cr, body, 32, 56, 18, (0.89, 0.92, 0.96), self.w-64, height=self.h-86-foot_h-engine_h)
-        self.text(cr, foot, 32, self.h-26-foot_h-engine_h, STATS_SIZE, (0.89, 0.92, 0.96), self.w-64, height=foot_h)
-        if engine:
-            self.text(cr, engine, 32, self.h-20-engine_h, FOOT_SIZE, (0.48, 0.54, 0.62), self.w-64, height=engine_h)
+            self.text(cr, body, 32, 56, 18, BRIGHT, self.w-64, height=self.h-86-len(rows)*ROW_H-note_h)
+        self.draw_rows(cr, rows, self.h-20-note_h-(14 if note else 0)-len(rows)*ROW_H, accent)
+        if note:
+            self.text(cr, note, 32, self.h-20-note_h, FOOT_SIZE, DIM, self.w-64, height=note_h)
 
     def draw(self, _, cr):
         now = time.monotonic()

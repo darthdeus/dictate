@@ -704,20 +704,21 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
     let marks = release_marks(ctx);
     let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
-    let mut parts = vec![format!("{:.2} s total", now_unix() - ctx.command_started)];
+    // Rows of "label\tvalue\tunit" for the card's table; a line without tabs is a note.
+    let mut parts = vec![format!("total\t{:.2}\ts", now_unix() - ctx.command_started)];
     if at("early_pass_used").is_some() {
-        parts.push("final pass done during pause".into());
+        parts.push("final pass\tin pause\t".into());
     } else if let Some(ms) = span("transcription_started", "transcription_finished") {
         let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
-        parts.push(format!("{engine} {ms:.0} ms"));
+        parts.push(format!("{engine}\t{ms:.0}\tms"));
     }
     if let Some(ms) = span("correction_started", "correction_finished") {
-        parts.push(format!("correction {ms:.0} ms"));
+        parts.push(format!("correction\t{ms:.0}\tms"));
     }
     if let Some(ms) = span("text_ready", "delivery_returned") {
-        parts.push(format!("paste {ms:.0} ms"));
+        parts.push(format!("paste\t{ms:.0}\tms"));
     }
-    parts.push(format!("{audio_secs:.1} s audio"));
+    parts.push(format!("audio\t{audio_secs:.1}\ts"));
     crate::usage::record_dictation(&ctx.state_dir(), &crate::usage::Dictation {
         ts: now_unix(),
         id: entry.and_then(|e| e.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
