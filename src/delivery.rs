@@ -6,6 +6,12 @@
 //! clipboard verified before shortcut, restore is best-effort background
 //! with still-holds-our-text guard. Backend probed once per delivery
 //! (`have_copyq`), never per clipboard op.
+//!
+//! Two engines (`DICTATE_PASTE_ENGINE`): `native` (default) owns the
+//! CLIPBOARD from a `clipboard-owner` worker over its own X connection and
+//! hands it back to copyq/xclip after the settle delay; `tools` runs
+//! copyq/xclip for every step. Both keep the guards above; the chord goes
+//! through `xdotool key` in both.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -96,19 +102,32 @@ pub struct ProcessClipboard {
     pub copyq_bin: String,
     /// Forced backend for tests (`Some("copyq"|"xclip")`), else auto-probe.
     pub force_backend: Option<String>,
+    /// The probe's answer: one `copyq size` per value, not one per
+    /// clipboard op (bash probes once per `deliver`). With copyq installed
+    /// but not running, each probe waits ~1 s for the server.
+    probed: std::sync::OnceLock<&'static str>,
 }
 
 impl ProcessClipboard {
     pub fn new() -> Self {
-        Self { xclip_bin: "xclip".into(), copyq_bin: "copyq".into(), force_backend: None }
+        Self::with_bins("xclip", "copyq", None)
     }
 
-    /// Probe once per delivery (bash `have_copyq`): copyq usable?
+    pub fn with_bins(xclip_bin: &str, copyq_bin: &str, force_backend: Option<&str>) -> Self {
+        Self {
+            xclip_bin: xclip_bin.into(),
+            copyq_bin: copyq_bin.into(),
+            force_backend: force_backend.map(str::to_string),
+            probed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Probed once per value (bash `have_copyq`): copyq usable?
     pub fn backend(&self) -> &'static str {
         if let Some(f) = &self.force_backend {
             return if f == "copyq" { "copyq" } else { "xclip" };
         }
-        if have_copyq(&self.copyq_bin) { "copyq" } else { "xclip" }
+        self.probed.get_or_init(|| if have_copyq(&self.copyq_bin) { "copyq" } else { "xclip" })
     }
 
     pub fn get(&self) -> String {
@@ -129,10 +148,15 @@ impl ProcessClipboard {
 
     pub fn set(&self, text: &str) -> Result<()> {
         if self.backend() == "copyq" {
-            std::process::Command::new(&self.copyq_bin)
+            // `copy` prints "true"; keep it off our stdout.
+            let status = std::process::Command::new(&self.copyq_bin)
                 .args(["copy", "--", text])
+                .stdout(std::process::Stdio::null())
                 .status()
                 .context("dictate: clipboard set failed")?;
+            if !status.success() {
+                anyhow::bail!("dictate: clipboard set failed");
+            }
         } else {
             use std::io::Write;
             let mut child = std::process::Command::new(&self.xclip_bin)
@@ -289,16 +313,249 @@ pub fn run_restore_worker(
     std::thread::sleep(std::time::Duration::from_secs_f64(settle_secs.max(0.0)));
     let expected = std::fs::read_to_string(expected_path).unwrap_or_default();
     let prev = std::fs::read_to_string(prev_path).unwrap_or_default();
-    let clip = ProcessClipboard {
-        xclip_bin: xclip_bin.to_string(),
-        copyq_bin: copyq_bin.to_string(),
-        force_backend: Some(backend.to_string()),
-    };
+    let clip = ProcessClipboard::with_bins(xclip_bin, copyq_bin, Some(backend));
     if !expected.is_empty() && should_restore_clipboard(&clip.get(), &expected) {
         let _ = clip.set(&prev);
     }
     let _ = std::fs::remove_file(expected_path);
     let _ = std::fs::remove_file(prev_path);
+}
+
+// ------------------------------------------------------- clipboard owner
+
+/// How `deliver` sets the clipboard (`DICTATE_PASTE_ENGINE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteEngine {
+    /// A `clipboard-owner` worker serves the text from an X connection of
+    /// its own; window class and the ready check go over our own one.
+    Native,
+    /// copyq/xclip/xdotool processes for every step (the old path).
+    Tools,
+}
+
+impl PasteEngine {
+    pub fn parse(s: &str) -> Self {
+        if s == "tools" { Self::Tools } else { Self::Native }
+    }
+}
+
+/// What the worker restores once the paste settled.
+///
+/// `prev` only while the clipboard still holds our dictation (we still own
+/// it, or whoever owns it now serves the same text): a newer user copy must
+/// win. Otherwise, while we still own it, our own text, so it outlives the
+/// worker the way `copyq copy`/`xclip` kept it. `None`: leave it alone.
+pub fn settled_clipboard<'a>(
+    restore: bool,
+    prev: &'a str,
+    ours: &'a str,
+    owned: bool,
+    current: impl FnOnce() -> Option<String>,
+) -> Option<&'a str> {
+    if restore && !prev.is_empty() && (owned || should_restore_clipboard(&current().unwrap_or_default(), ours)) {
+        Some(prev)
+    } else if owned {
+        Some(ours)
+    } else {
+        None
+    }
+}
+
+enum OwnerMsg {
+    Offer { restore: bool, settle: f64, text: String },
+    Pasted,
+    Eof,
+}
+
+/// Parses the worker's stdin: `offer <restore|keep> <settle> <len>\n<text>`,
+/// then `pasted\n`. Anything else, or EOF, ends the conversation.
+fn read_owner_msgs(tx: std::sync::mpsc::Sender<OwnerMsg>) {
+    use std::io::{BufRead, Read};
+    let stdin = std::io::stdin();
+    let mut r = stdin.lock();
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            let _ = tx.send(OwnerMsg::Eof);
+            return;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let msg = match parts.as_slice() {
+            ["offer", mode, settle, len] => {
+                let Ok(len) = len.parse::<usize>() else { break };
+                let mut buf = vec![0u8; len];
+                if r.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                OwnerMsg::Offer {
+                    restore: *mode == "restore",
+                    settle: settle.parse().unwrap_or(0.4),
+                    text: String::from_utf8_lossy(&buf).into_owned(),
+                }
+            }
+            ["pasted"] => OwnerMsg::Pasted,
+            _ => break,
+        };
+        if tx.send(msg).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(OwnerMsg::Eof);
+}
+
+/// Hidden `clipboard-owner` worker, spawned by `stop` while recognition
+/// runs. Connects to X and reads the clipboard to restore; on `offer` it
+/// re-reads it (a copy made meanwhile wins), takes the CLIPBOARD with our
+/// text and answers `ready` once the server lists it as owner. It serves
+/// pastes until `pasted` (or EOF) plus the settle delay, then hands the
+/// clipboard back through copyq/xclip (`settled_clipboard`) and exits once
+/// the new owner took over. Outlives `stop` like the restore worker.
+pub fn run_clipboard_owner(xclip_bin: &str, copyq_bin: &str) {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let say = |line: &str| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    };
+    let x = match crate::x11::X::connect() {
+        Ok(x) => x,
+        Err(e) => return say(&format!("fail {e:#}")),
+    };
+    // Probe copyq now, not at handover: with copyq installed but not
+    // running the probe takes ~1 s, which would delay the restore.
+    let (xclip, copyq) = (xclip_bin.to_string(), copyq_bin.to_string());
+    let probe = std::thread::spawn(move || {
+        let clip = ProcessClipboard::with_bins(&xclip, &copyq, None);
+        clip.backend();
+        clip
+    });
+    let early_prev = x.read_restorable(Duration::from_millis(300));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || read_owner_msgs(tx));
+    let (restore, settle, text) = match rx.recv() {
+        Ok(OwnerMsg::Offer { restore, settle, text }) => (restore, settle, text),
+        _ => return,
+    };
+    let prev = if restore {
+        match x.read_restorable(Duration::from_millis(50)) {
+            Ok(v) => v.unwrap_or_default(),
+            Err(_) => early_prev.ok().flatten().unwrap_or_default(),
+        }
+    } else {
+        String::new()
+    };
+    let offered_prev = (restore && !prev.is_empty()).then(|| prev.clone());
+    let mut owner = match crate::x11::ClipboardOwner::take(x, text.clone(), offered_prev) {
+        Ok(o) => o,
+        Err(e) => return say(&format!("fail {e:#}")),
+    };
+    say("ready");
+    // Serve the paste. A parent that never says `pasted` (killed, hung) is
+    // treated like one that did after 30 s.
+    let mut done = false;
+    let _ = owner.serve_until(Instant::now() + Duration::from_secs(30), |_| {
+        done = done || !matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        done
+    });
+    let _ = owner.serve_until(Instant::now() + Duration::from_secs_f64(settle.max(0.0)), |_| false);
+    let owned = owner.owned();
+    let fin = settled_clipboard(restore, &prev, &text, owned, || {
+        owner.read_clipboard(Duration::from_millis(200)).ok().flatten()
+    })
+    .map(str::to_string);
+    let Some(fin) = fin else {
+        owner.drain();
+        return;
+    };
+    let clip = probe.join().unwrap_or_else(|_| ProcessClipboard::with_bins(xclip_bin, copyq_bin, None));
+    // Keep serving while the tool takes over, so neither a gap nor a paste
+    // in flight goes unanswered. If the tool failed, keep serving like
+    // xclip would until someone copies.
+    let setter = std::thread::spawn(move || clip.set(&fin).is_ok());
+    let mut setter = Some(setter);
+    let mut give_up = Instant::now() + Duration::from_secs(30 * 86400);
+    while owner.owned() && Instant::now() < give_up {
+        let _ = owner.serve_until(Instant::now() + Duration::from_millis(50), |o| !o.owned());
+        // Normally SelectionClear arrives first; once the tool succeeded,
+        // don't wait forever for one that got lost.
+        if setter.as_ref().is_some_and(|h| h.is_finished())
+            && setter.take().and_then(|h| h.join().ok()) == Some(true)
+        {
+            give_up = Instant::now() + Duration::from_secs(2);
+        }
+    }
+    owner.drain();
+}
+
+/// `stop`'s end of a `clipboard-owner` worker.
+pub struct OwnerWorker {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl OwnerWorker {
+    pub fn spawn(exe: &Path) -> Result<Self> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = std::process::Command::new(exe)
+            .args(["clipboard-owner", "xclip", "copyq"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("dictate: clipboard worker unavailable")?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().context("dictate: clipboard worker unavailable")?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self { child, stdin, lines })
+    }
+
+    /// Hands over the text; returns once the worker owns the clipboard.
+    /// On failure the worker is killed, so it cannot take the clipboard
+    /// later behind a fallback.
+    pub fn offer(&mut self, text: &str, restore: bool, settle_secs: f64, timeout: std::time::Duration) -> Result<()> {
+        use std::io::Write;
+        let r = (|| {
+            let stdin = self.stdin.as_mut().context("worker stdin closed")?;
+            writeln!(stdin, "offer {} {} {}", if restore { "restore" } else { "keep" }, settle_secs.max(0.0), text.len())?;
+            stdin.write_all(text.as_bytes())?;
+            stdin.flush()?;
+            match self.lines.recv_timeout(timeout) {
+                Ok(l) if l == "ready" => Ok(()),
+                Ok(l) => anyhow::bail!("{l}"),
+                Err(_) => anyhow::bail!("no answer"),
+            }
+        })();
+        if r.is_err() {
+            self.abandon();
+        }
+        r
+    }
+
+    /// The paste key went out: the worker starts its settle delay.
+    pub fn pasted(mut self) {
+        use std::io::Write;
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.write_all(b"pasted\n");
+        }
+    }
+
+    /// Kills the worker (no paste through it).
+    pub fn abandon(&mut self) {
+        self.stdin = None;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +677,28 @@ mod tests {
         std::fs::write(&prev, "prev text").unwrap();
         run_restore_worker("xclip", 0.0, &expected, &prev, &fake, "copyq");
         assert_eq!(std::fs::read_to_string(&state).unwrap(), "user copied this");
+    }
+
+    #[test]
+    fn settled_clipboard_guards() {
+        let none = || -> Option<String> { panic!("owner known: no read") };
+        // Still ours: restore the previous clipboard.
+        assert_eq!(settled_clipboard(true, "prev", "ours", true, none), Some("prev"));
+        // Someone else serves the same text (e.g. a manager took it over).
+        assert_eq!(settled_clipboard(true, "prev", "ours", false, || Some("ours".into())), Some("prev"));
+        // A newer user copy wins.
+        assert_eq!(settled_clipboard(true, "prev", "ours", false, || Some("user".into())), None);
+        assert_eq!(settled_clipboard(true, "prev", "ours", false, || None), None);
+        // Nothing to restore, keep mode: persist our text while we own it.
+        assert_eq!(settled_clipboard(true, "", "ours", true, none), Some("ours"));
+        assert_eq!(settled_clipboard(false, "prev", "ours", true, none), Some("ours"));
+        assert_eq!(settled_clipboard(false, "prev", "ours", false, none), None);
+    }
+
+    #[test]
+    fn paste_engine_defaults_native() {
+        assert_eq!(PasteEngine::parse("tools"), PasteEngine::Tools);
+        assert_eq!(PasteEngine::parse("native"), PasteEngine::Native);
+        assert_eq!(PasteEngine::parse(""), PasteEngine::Native);
     }
 }

@@ -26,6 +26,7 @@ pub mod timings;
 pub mod transcribe;
 pub mod usage;
 pub mod wav;
+pub mod x11;
 
 /// Serializes tests that shell out to helper binaries (fake-script exec,
 /// `grep -E` matching). Under parallel load, back-to-back exec in this

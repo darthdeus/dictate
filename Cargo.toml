@@ -26,6 +26,9 @@ serde_json = "1"
 # Push it to a reachable remote and point `git` there before packaging.
 transcribe-cpp = { git = "file:///home/darth/projects/transcribe.cpp", rev = "6c24521cb008be10adee292107004eea96a83c95", default-features = false, features = ["vulkan"] }
 ureq = { version = "2", features = ["json"] }
+# Pure-Rust X11 client: clipboard ownership and window class without
+# spawning copyq/xclip/xdotool on the paste path.
+x11rb = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

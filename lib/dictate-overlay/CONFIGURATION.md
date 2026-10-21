@@ -86,3 +86,44 @@ preview only; the final text still comes from the final pass.
   into the term. Multi-word phrases are always kept.
 - `DICTATE_PREVIEW_STOP`: extra comma-separated terms (case-insensitive) to
   leave out of that default list, for personal terms that misfire.
+
+## Text delivery
+
+The finished text reaches the focused window by pasting it through the
+CLIPBOARD selection: `ctrl+v`, or `ctrl+shift+v` when the window class is a
+terminal (`DICTATE_TERMINALS`; a plain `ctrl+v` there is a literal `^V`, and
+the shifted chord goes through bracketed paste). A window without a class is
+typed into instead, unless `DICTATE_INPUT=paste`.
+
+- `DICTATE_INPUT`: `auto` (default), `paste`, or `type` (always synthesize
+  keystrokes; slow, `DICTATE_TYPE_DELAY` ms per character).
+- `DICTATE_CLIPBOARD`: `restore` (default) puts the previous clipboard text
+  back `DICTATE_PASTE_SETTLE` seconds (default `0.4`) after the paste key,
+  but only while the clipboard still holds the dictation: something you copy
+  in the meantime wins. `keep` leaves the dictation on the clipboard. Only
+  plain text is restored.
+- `DICTATE_PASTE_KEY_DELAY`: seconds between the chord's key events
+  (default `0.012`, xdotool's usual spacing). Most of what the paste step
+  still costs is this spacing.
+- `DICTATE_PASTE_ENGINE`: `native` (default) or `tools`.
+  - `native`: while the text is being recognized, `stop` starts a
+    `dictate clipboard-owner` worker that connects to X and reads the
+    clipboard to restore. At paste time the worker takes the CLIPBOARD
+    itself and reports back once the X server lists it as the owner; `stop`
+    reads the text back through the server before it sends the chord, so a
+    paste can never pick up the previous contents. The window class comes
+    from the same in-process X connection. The worker serves the paste, then
+    after the settle delay hands the clipboard to copyq (or xclip): the
+    previous text when restoring, else the dictation, so it outlives the
+    worker. While the worker holds it the selection carries
+    `x-kde-passwordManagerHint: secret`, so CopyQ and Klipper keep the
+    dictation out of their history, as `copyq copy` did. If the native path
+    fails before anything reached the window, `stop` falls back to `tools`
+    and notes it in the log.
+  - `tools`: the previous behavior, one copyq/xclip/xdotool process per
+    step (copyq: about 40 ms each), with the ready check polling the
+    clipboard every 20 ms for up to 200 ms.
+
+`dictate paste-bench` (hidden) times each delivery step. It sets the
+clipboard and sends keys, so run it only against an isolated X server, for
+example `Xvfb :77` with a window manager and a focused text field.

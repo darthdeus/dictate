@@ -107,6 +107,9 @@ enum Command {
         #[arg(default_value = "Paste bench text")]
         text: String,
     },
+    /// Hidden: serves the dictation as the clipboard, then restores (spawned by `stop`/`retry`)
+    #[command(hide = true)]
+    ClipboardOwner { xclip_bin: String, copyq_bin: String },
     /// Hidden: clipboard restore worker (spawned detached by `stop`/`retry`)
     #[command(hide = true)]
     RestoreClipboard {
@@ -144,6 +147,10 @@ fn main() -> anyhow::Result<()> {
                 &xclip_bin,
                 &copyq_bin,
             );
+            return Ok(());
+        }
+        Command::ClipboardOwner { xclip_bin, copyq_bin } => {
+            dictate_lib::delivery::run_clipboard_owner(&xclip_bin, &copyq_bin);
             return Ok(());
         }
         Command::PasteBench { runs, work_ms, gap_ms, text } => {

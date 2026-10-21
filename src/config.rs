@@ -53,6 +53,7 @@ pub fn known_keys() -> HashSet<&'static str> {
         "DICTATE_OSD_SLIDE_STEP_DELAY",
         "DICTATE_OSD_WIDTH",
         "DICTATE_PARAKEET_MODEL",
+        "DICTATE_PASTE_ENGINE",
         "DICTATE_PASTE_KEY_DELAY",
         "DICTATE_PASTE_SETTLE",
         "DICTATE_PROMPT",

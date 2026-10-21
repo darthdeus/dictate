@@ -18,7 +18,8 @@ use crate::audio::{self, AudioBackend, ProcessAudio, RawFormat};
 use crate::config::Config;
 use crate::correct::Corrector;
 use crate::daemon;
-use crate::delivery::{self, DeliveryAction, InputMode, ProcessClipboard, Xdotool};
+use crate::delivery::{self, DeliveryAction, InputMode, OwnerWorker, PasteEngine, ProcessClipboard, Xdotool};
+use crate::x11::X;
 use crate::history::HistoryStore;
 use crate::overlay::{map_notify, JsonFileOverlay, OverlayBackend, OverlayMessage};
 use crate::paths::Paths;
@@ -1196,18 +1197,60 @@ fn llm_cleanup(ctx: &Ctx, raw: &str) -> String {
 // ----------------------------------------------------------------- deliver
 
 /// Delivery work started while the text is still being recognized.
+#[derive(Default)]
 pub struct DeliveryPrefetch {
-    saved_clipboard: Option<std::thread::JoinHandle<String>>,
+    /// Tools engine: the probed backend and the clipboard to restore.
+    tools: Option<std::thread::JoinHandle<(ProcessClipboard, String)>>,
+    /// Native engine: our X connection and a `clipboard-owner` worker that
+    /// has already read the clipboard to restore.
+    x: Option<std::thread::JoinHandle<Result<X>>>,
+    owner: Option<OwnerWorker>,
+}
+
+fn paste_engine(ctx: &Ctx) -> PasteEngine {
+    PasteEngine::parse(&ctx.c("DICTATE_PASTE_ENGINE", "native"))
+}
+
+fn restore_mode(ctx: &Ctx) -> bool {
+    ctx.c("DICTATE_CLIPBOARD", "restore") == "restore"
+}
+
+fn settle_secs(ctx: &Ctx) -> f64 {
+    ctx.c("DICTATE_PASTE_SETTLE", "0.4").parse().unwrap_or(0.4)
+}
+
+fn dictate_exe() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dictate"))
 }
 
 /// Starts what `deliver_with` needs before the text exists, so it runs
-/// while whisper does.
+/// while whisper does: process spawns, X connections, and reading the
+/// clipboard to restore.
 fn prefetch_delivery(ctx: &Ctx) -> DeliveryPrefetch {
-    // Save the clipboard for restoring while whisper runs, not after it
-    // (copyq answers in ~60 ms). A copy made in between would be lost.
-    let saved_clipboard = (ctx.c("DICTATE_CLIPBOARD", "restore") == "restore")
-        .then(|| std::thread::spawn(|| ProcessClipboard::new().get()));
-    DeliveryPrefetch { saved_clipboard }
+    if InputMode::parse(&ctx.c("DICTATE_INPUT", "auto")) == InputMode::Type {
+        return DeliveryPrefetch::default();
+    }
+    match paste_engine(ctx) {
+        PasteEngine::Native => DeliveryPrefetch {
+            x: Some(std::thread::spawn(X::connect)),
+            owner: OwnerWorker::spawn(&dictate_exe()).ok(),
+            ..Default::default()
+        },
+        PasteEngine::Tools => {
+            // Save the clipboard for restoring while whisper runs, not after
+            // it (copyq answers in ~60 ms). A copy made in between is lost.
+            let restore = restore_mode(ctx);
+            DeliveryPrefetch {
+                tools: Some(std::thread::spawn(move || {
+                    let clip = ProcessClipboard::new();
+                    clip.backend();
+                    let prev = if restore { clip.get() } else { String::new() };
+                    (clip, prev)
+                })),
+                ..Default::default()
+            }
+        }
+    }
 }
 
 /// Owns the clipboard from here: reads previous contents first (bash order),
@@ -1218,12 +1261,64 @@ pub fn deliver(ctx: &Ctx, text: &str) {
 
 /// `deliver` with the work `prefetch_delivery` started (`None`: do it now).
 fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
-    let saved_clipboard = prefetch.and_then(|p| p.saved_clipboard).and_then(|h| h.join().ok());
     let mode = InputMode::parse(&ctx.c("DICTATE_INPUT", "auto"));
     if mode == InputMode::Type {
         let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
         return;
     }
+    let p = prefetch.unwrap_or_default();
+    if paste_engine(ctx) == PasteEngine::Native {
+        let x = match p.x.map(|h| h.join()) {
+            Some(Ok(Ok(x))) => Ok(x),
+            _ => X::connect(),
+        };
+        let r = x.and_then(|x| deliver_native(ctx, text, mode, &x, p.owner));
+        match r {
+            Ok(()) => return,
+            Err(e) => append_log(&ctx.log, &format!("note: native paste unavailable ({e:#}), using copyq/xclip")),
+        }
+    }
+    deliver_tools(ctx, text, mode, p.tools.and_then(|h| h.join().ok()));
+}
+
+/// The native engine. `Err` only before anything reached the window, so
+/// the caller can fall back to the tools engine.
+fn deliver_native(ctx: &Ctx, text: &str, mode: InputMode, x: &X, owner: Option<OwnerWorker>) -> Result<()> {
+    let cls = x.active_window_class();
+    ctx.mark("window_class_read");
+    let chord = match delivery::select_action(mode, &cls, &ctx.c("DICTATE_TERMINALS", delivery::DEFAULT_TERMINALS)) {
+        DeliveryAction::Type => {
+            let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+            return Ok(());
+        }
+        DeliveryAction::Paste { chord } => chord,
+    };
+    let mut owner = match owner {
+        Some(o) => o,
+        None => OwnerWorker::spawn(&dictate_exe())?,
+    };
+    ctx.mark("clipboard_backend_selected");
+    // The worker re-reads the clipboard to restore, takes it, and answers
+    // once the X server lists it as the owner.
+    owner.offer(text, restore_mode(ctx), settle_secs(ctx), std::time::Duration::from_secs(1))?;
+    ctx.mark("clipboard_set");
+    // Never paste what was there before: read it back through the server.
+    if x.read_clipboard(std::time::Duration::from_millis(200)).ok().flatten().as_deref() != Some(text) {
+        append_log(&ctx.log, "note: clipboard not ready, typing instead");
+        // The worker still restores the previous clipboard when it settles.
+        owner.pasted();
+        let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+        return Ok(());
+    }
+    ctx.mark("clipboard_verified");
+    let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), ctx.timing_tsv());
+    owner.pasted();
+    Ok(())
+}
+
+/// The tools engine (`DICTATE_PASTE_ENGINE=tools`, and the fallback):
+/// copyq or xclip and xdotool processes for every step.
+fn deliver_tools(ctx: &Ctx, text: &str, mode: InputMode, saved: Option<(ProcessClipboard, String)>) {
     let cls = ctx.xdotool().active_window_class();
     ctx.mark("window_class_read");
     match delivery::select_action(mode, &cls, &ctx.c("DICTATE_TERMINALS", delivery::DEFAULT_TERMINALS)) {
@@ -1231,9 +1326,13 @@ fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
             let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
         }
         DeliveryAction::Paste { chord } => {
-            let clip = ctx.clipboard();
+            let (clip, saved_clipboard) = match saved {
+                Some((clip, prev)) => (clip, Some(prev)),
+                None => (ctx.clipboard(), None),
+            };
+            clip.backend();
             ctx.mark("clipboard_backend_selected");
-            let prev = if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" {
+            let prev = if restore_mode(ctx) {
                 saved_clipboard.unwrap_or_else(|| clip.get())
             } else {
                 String::new()
@@ -1251,14 +1350,12 @@ fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
             }
             ctx.mark("clipboard_verified");
             let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), ctx.timing_tsv());
-            if ctx.c("DICTATE_CLIPBOARD", "restore") == "restore" && !prev.is_empty() {
+            if restore_mode(ctx) && !prev.is_empty() {
                 // Detached re-execution outlives `stop` (bash background
                 // subshell); a thread here would die with the process before
                 // the settle delay elapsed and never restore.
-                let settle: f64 = ctx.c("DICTATE_PASTE_SETTLE", "0.4").parse().unwrap_or(0.4);
-                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dictate"));
                 if delivery::schedule_detached_restore(
-                    &ctx.paths.datadir, &exe, &clip, text, &prev, settle,
+                    &ctx.paths.datadir, &dictate_exe(), &clip, text, &prev, settle_secs(ctx),
                 ).is_err() {
                     append_log(&ctx.log, "note: clipboard restore unavailable, keeping dictation text");
                 }
