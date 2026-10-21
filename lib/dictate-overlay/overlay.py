@@ -133,7 +133,8 @@ class Overlay(Gtk.Window):
             self.base_y = rect.y + 24
         else:
             self.x = rect.x + (rect.width-self.w)//2
-            self.base_y = rect.y + (rect.height-252)//2
+            # Top center, growing down: the middle of the screen is where you work.
+            self.base_y = rect.y + 24
         if self.get_realized():
             self.reshape()
         self.y = min(self.base_y, rect.y+rect.height-24-self.target_h)
