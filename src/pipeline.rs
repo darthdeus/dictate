@@ -521,7 +521,13 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         Some(r) if r.starts_with("ok") => {
             ctx.mark("recorder_stopped");
             notify(ctx, "\u{23f3} Transcribing", "", 30000);
-            return finish_stop(ctx);
+            let early = r.ends_with(" early").then(|| {
+                let path = early_pass_path(&ctx.paths);
+                let early = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                let _ = std::fs::remove_file(&path);
+                early
+            }).flatten();
+            return finish_stop(ctx, early);
         }
         Some(r) if r.starts_with("error") => {
             let _ = std::fs::remove_file(&ctx.paths.startfile);
@@ -588,12 +594,12 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    finish_stop(ctx)
+    finish_stop(ctx, None)
 }
 
 /// The rest of `stop` once `Paths::wav` holds the clip: archive, transcribe,
 /// deliver.
-fn finish_stop(ctx: &Ctx) -> Result<()> {
+fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     ctx.mark("audio_prepared");
     // Save the clipboard for restoring while whisper runs, not after it
     // (copyq answers in ~60 ms). A copy made in between would be lost.
@@ -634,7 +640,7 @@ fn finish_stop(ctx: &Ctx) -> Result<()> {
     notify(ctx, "\u{23f3} transcribing\u{2026}", "", 15000);
 
     let mode = ctx.state.take_mode();
-    let text = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode) {
+    let text = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early) {
         Err(e) => {
             notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
             return Err(e);
@@ -691,7 +697,9 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
     let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
     let mut parts = vec![format!("{:.2} s total", now_unix() - ctx.command_started)];
-    if let Some(ms) = span("transcription_started", "transcription_finished") {
+    if at("early_pass_used").is_some() {
+        parts.push("final pass done during your pause".into());
+    } else if let Some(ms) = span("transcription_started", "transcription_finished") {
         parts.push(format!("whisper {ms:.0} ms"));
     }
     if let Some(ms) = span("correction_started", "correction_finished") {
@@ -734,18 +742,9 @@ pub enum TextOutcome {
 /// mono 16 kHz wav — everything `stop` does between capture and delivery,
 /// shared with `replay`. History statuses and transcripts are written only
 /// when `entry` is given; overlay notices are left to the caller.
-fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -> Result<TextOutcome> {
-    let mut whisper = WhisperConfig::new(
-        &ctx.server(), &ctx.model(),
-        &ctx.c("DICTATE_LANG", "auto"), &ctx.c("DICTATE_PROMPT", ""),
-        ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8));
-    if ctx.c("DICTATE_VAD", "0") == "1" {
-        let vm = ctx.vad_model();
-        if Path::new(&vm).exists() {
-            whisper.vad_model = Some(vm);
-            whisper.vad_threshold = ctx.c("DICTATE_VAD_THRESHOLD", "0.5");
-        }
-    }
+fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str, early: Option<EarlyPass>)
+    -> Result<TextOutcome> {
+    let pass = FinalPass::new(ctx);
 
     // Measured in-process for our own 16 kHz clips; ffmpeg cost ~100 ms here.
     let peak = match wav::read_mono16(wav) {
@@ -761,8 +760,7 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
         wav.to_path_buf()
     };
 
-    let min_peak: f64 = ctx.c("DICTATE_MIN_PEAK", "-45").parse().unwrap_or(-45.0);
-    if is_silence(peak, min_peak) {
+    if is_silence(peak, pass.min_peak) {
         if let Some(e) = entry {
             ctx.history.set_status(e, "silence");
         }
@@ -774,8 +772,12 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
         ctx.history.set_status(e, "transcribing");
     }
     ctx.mark("transcription_started");
-    let raw_text = match ctx.engine() {
-        Engine::Parakeet => {
+    let raw_text = match (&early, ctx.engine()) {
+        (Some(e), _) => {
+            ctx.mark("early_pass_used");
+            Ok(e.raw.clone())
+        }
+        (None, Engine::Parakeet) => {
             let pc = ParakeetConfig {
                 model: ctx.parakeet_model(),
                 threads: ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8),
@@ -783,7 +785,10 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
             };
             transcribe::transcribe_parakeet(&feed, &pc, &ctx.log)
         }
-        Engine::Whisper => transcribe_whisper_pieces(ctx, &feed, &whisper, min_peak),
+        (None, Engine::Whisper) => match wav::read_mono16(&feed) {
+            Ok(samples) => pass.whisper(&samples),
+            Err(_) => transcribe::transcribe_whisper(&feed, &pass.whisper, &ctx.log),
+        },
     };
     let Ok(raw_text) = raw_text else {
         if let Some(e) = entry {
@@ -832,9 +837,13 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
         return Ok(TextOutcome::Noise(text));
     }
 
-    if ctx.c("DICTATE_CORRECT", "0") == "1" {
-        ctx.mark("correction_started");
-        match Corrector::from_config(&ctx.cfg, &ctx.terms()).and_then(|c| c.correct(&text)) {
+    ctx.mark("correction_started");
+    let corrected = match early.and_then(|e| e.corrected.filter(|_| e.clean == text)) {
+        Some(fixed) => Some(Ok(fixed)),
+        None => pass.correct(&text),
+    };
+    if let Some(corrected) = corrected {
+        match corrected {
             Ok(fixed) => {
                 if fixed != text {
                     if let Some(e) = entry {
@@ -858,30 +867,88 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
     Ok(TextOutcome::Ready { raw, text })
 }
 
-/// Long clips go to whisper in pieces cut at pauses (see
-/// `wav::WHISPER_PIECE_SECS`); a clip that cannot be read here goes whole.
-/// Silent pieces are skipped: whisper invents "Thank you." for silence.
-fn transcribe_whisper_pieces(ctx: &Ctx, wav_path: &Path, cfg: &WhisperConfig, min_peak: f64) -> Result<String> {
-    let samples = match wav::read_mono16(wav_path) {
-        Ok(s) => s,
-        Err(_) => return transcribe::transcribe_whisper(wav_path, cfg, &ctx.log),
-    };
-    let pieces = wav::split_at_pauses(&samples, wav::WHISPER_PIECE_SECS);
-    if pieces.len() == 1 {
-        return transcribe::transcribe_whisper(wav_path, cfg, &ctx.log);
-    }
-    let mut texts = Vec::new();
-    for (i, range) in pieces.into_iter().enumerate() {
-        if is_silence(Some(wav::peak_db(&samples[range.clone()])), min_peak) {
-            continue;
+/// The final pass after capture: whisper, then the optional correction. The
+/// daemon also runs it while you pause, so a dictation that ends in a pause
+/// is ready the moment the key comes up (`EarlyPass`).
+pub struct FinalPass {
+    whisper: WhisperConfig,
+    /// `None`: correction is off; `Err`: on but unusable (missing key).
+    corrector: Option<std::result::Result<Corrector, String>>,
+    log: PathBuf,
+    scratch: PathBuf,
+    min_peak: f64,
+}
+
+/// A final pass the daemon finished during a pause that turned out to be
+/// the end of the dictation.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct EarlyPass {
+    pub raw: String,
+    /// The correction of `clean`, used only if the final text still matches
+    /// `clean` when correction comes up (nothing rewrote it in between).
+    pub clean: String,
+    pub corrected: Option<String>,
+}
+
+impl FinalPass {
+    pub fn new(ctx: &Ctx) -> Self {
+        let mut whisper = WhisperConfig::new(
+            &ctx.server(), &ctx.model(),
+            &ctx.c("DICTATE_LANG", "auto"), &ctx.c("DICTATE_PROMPT", ""),
+            ctx.c("DICTATE_THREADS", "8").parse().unwrap_or(8));
+        if ctx.c("DICTATE_VAD", "0") == "1" {
+            let vm = ctx.vad_model();
+            if Path::new(&vm).exists() {
+                whisper.vad_model = Some(vm);
+                whisper.vad_threshold = ctx.c("DICTATE_VAD_THRESHOLD", "0.5");
+            }
         }
-        let piece = ctx.paths.datadir.join(format!("dictate-piece-{}-{i}.wav", std::process::id()));
-        wav::write_mono16(&piece, &samples[range])?;
-        let text = transcribe::transcribe_whisper(&piece, cfg, &ctx.log);
-        let _ = std::fs::remove_file(&piece);
-        texts.push(text?);
+        let corrector = (ctx.c("DICTATE_CORRECT", "0") == "1")
+            .then(|| Corrector::from_config(&ctx.cfg, &ctx.terms()).map_err(|e| format!("{e:#}")));
+        Self {
+            whisper,
+            corrector,
+            log: ctx.log.clone(),
+            scratch: ctx.paths.datadir.clone(),
+            min_peak: ctx.c("DICTATE_MIN_PEAK", "-45").parse().unwrap_or(-45.0),
+        }
     }
-    Ok(texts.join(" "))
+
+    /// Whisper's text for 16 kHz mono samples. Long clips go in pieces cut
+    /// at pauses (see `wav::WHISPER_PIECE_SECS`), and silent pieces are
+    /// skipped: whisper invents "Thank you." for silence.
+    pub fn whisper(&self, samples: &[i16]) -> Result<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PIECE: AtomicU64 = AtomicU64::new(0);
+        let pieces = wav::split_at_pauses(samples, wav::WHISPER_PIECE_SECS);
+        let single = pieces.len() == 1;
+        let mut texts = Vec::new();
+        for range in pieces {
+            if !single && is_silence(Some(wav::peak_db(&samples[range.clone()])), self.min_peak) {
+                continue;
+            }
+            let n = PIECE.fetch_add(1, Ordering::Relaxed);
+            let piece = self.scratch.join(format!("dictate-piece-{}-{n}.wav", std::process::id()));
+            wav::write_mono16(&piece, &samples[range])?;
+            let text = transcribe::transcribe_whisper(&piece, &self.whisper, &self.log);
+            let _ = std::fs::remove_file(&piece);
+            texts.push(text?);
+        }
+        Ok(texts.join(" "))
+    }
+
+    /// `None` when correction is off.
+    pub fn correct(&self, text: &str) -> Option<Result<String>> {
+        Some(match self.corrector.as_ref()? {
+            Ok(c) => c.correct(text),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        })
+    }
+}
+
+/// Where the daemon leaves an early pass for `stop`.
+pub fn early_pass_path(paths: &Paths) -> PathBuf {
+    paths.datadir.join("dictate-early.json")
 }
 
 /// Optional experimental ffmpeg filter chain (bash `$FILTER`); empty default.
@@ -1075,7 +1142,7 @@ pub fn cmd_replay(ctx: &Ctx, n: usize) -> Result<i32> {
         total += 1;
         let id = entry.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let started = now_unix();
-        let now = match transcribe_to_text(ctx, &wav, None, "fast") {
+        let now = match transcribe_to_text(ctx, &wav, None, "fast", None) {
             Ok(TextOutcome::Ready { text, .. }) => text,
             Ok(TextOutcome::Silence(_)) => "<silence>".into(),
             Ok(TextOutcome::NoSpeech) => "<no speech>".into(),

@@ -10,9 +10,14 @@
 //! the final pass (whisper, optional correction) and delivers, since it has
 //! the X session that typing and the clipboard need.
 //!
+//! While you pause mid-recording it already runs that final pass on the
+//! audio so far (`EarlyWorker`). If the pause was the end, `stop` replies
+//! `ok <seconds> early` and leaves the result at `early_pass_path`, so the
+//! stop process only has to paste.
+//!
 //! Protocol, one request line and one reply line:
 //!   start  -> ok | busy | error <why>
-//!   stop   -> ok <seconds> | idle | error <why>
+//!   stop   -> ok <seconds> [early] | idle | error <why>
 //!   status -> recording | idle
 
 use anyhow::{Context, Result};
@@ -20,7 +25,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -29,7 +34,7 @@ use transcribe_cpp::{Model, ParakeetStreamOptions, RunOptions, Session, StreamEx
 
 use crate::overlay::{JsonFileOverlay, OverlayBackend, OverlayMessage, Phase};
 use crate::paths::Paths;
-use crate::pipeline::{append_log, now_unix, Ctx};
+use crate::pipeline::{append_log, early_pass_path, now_unix, Ctx, EarlyPass, FinalPass};
 use crate::wav::{self, RATE};
 
 /// Audio per `feed`: 160 ms, the model's native step at right context 1.
@@ -73,7 +78,8 @@ struct Recording {
     recorder: u32,
     stop: Arc<AtomicBool>,
     wav: PathBuf,
-    thread: JoinHandle<(Session, Result<Vec<i16>>)>,
+    early_path: PathBuf,
+    thread: JoinHandle<(Session, Result<(Vec<i16>, Option<EarlyPass>)>)>,
 }
 
 /// `dictate daemon`: serve until killed. `load_ctx` is called per recording,
@@ -170,6 +176,8 @@ fn start(ctx: Ctx, session: Session) -> std::result::Result<Recording, (Session,
     let stop = Arc::new(AtomicBool::new(false));
     let recorder = child.id();
     let wav = ctx.paths.wav.clone();
+    let early_path = early_pass_path(&ctx.paths);
+    let _ = std::fs::remove_file(&early_path);
     let flag = stop.clone();
     let thread = std::thread::spawn(move || {
         let mut session = session;
@@ -179,7 +187,7 @@ fn start(ctx: Ctx, session: Session) -> std::result::Result<Recording, (Session,
         }
         (session, res)
     });
-    Ok(Recording { recorder, stop, wav, thread })
+    Ok(Recording { recorder, stop, wav, early_path, thread })
 }
 
 fn stop(r: Recording) -> (Session, String) {
@@ -188,11 +196,16 @@ fn stop(r: Recording) -> (Session, String) {
     // SIGINT makes pw-record flush and exit; the reader then sees EOF.
     crate::state::send_int(r.recorder);
     let (session, res) = r.thread.join().expect("dictate daemon: capture thread panicked");
-    let reply = match res.and_then(|audio| {
+    let reply = match res.and_then(|(audio, early)| {
         wav::write_mono16(&r.wav, &audio)?;
-        Ok(audio.len() as f64 / RATE as f64)
+        let early = match early {
+            Some(e) => std::fs::write(&r.early_path, serde_json::to_vec(&e)?).is_ok(),
+            None => false,
+        };
+        Ok((audio.len() as f64 / RATE as f64, early))
     }) {
-        Ok(secs) => format!("ok {secs:.2}"),
+        Ok((secs, true)) => format!("ok {secs:.2} early"),
+        Ok((secs, false)) => format!("ok {secs:.2}"),
         Err(e) => format!("error {e:#}"),
     };
     (session, reply)
@@ -201,7 +214,7 @@ fn stop(r: Recording) -> (Session, String) {
 /// Reads the recorder until EOF (stop) or `DICTATE_MAX_SECS`, feeding the
 /// model 160 ms at a time and publishing each change of the preview.
 fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, chan: usize, stop: &AtomicBool)
-    -> Result<Vec<i16>> {
+    -> Result<(Vec<i16>, Option<EarlyPass>)> {
     let mut out = child.stdout.take().context("recorder has no stdout")?;
     let frame = channels * 2;
     let chunk_bytes = RATE as usize * CHUNK_MS / 1000 * frame;
@@ -214,6 +227,7 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
 
     let mut stream = session.stream(&RunOptions::default(), &stream_options(right_context(ctx)))?;
     let mut audio: Vec<i16> = Vec::with_capacity(RATE as usize * 60);
+    let mut early = EarlyWorker::new(ctx);
     let mut buf = vec![0u8; chunk_bytes];
     let mut eof = false;
     while !eof && audio.len() < max_samples {
@@ -241,6 +255,7 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
             let _ = f.write_all(&bytes);
         }
         audio.extend_from_slice(&mono);
+        early.heard(&audio);
         let pcm: Vec<f32> = mono.iter().map(|&s| s as f32 / 32768.0).collect();
         let update = stream.feed(&pcm)?;
         if update.committed_changed || update.tentative_changed {
@@ -256,7 +271,101 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
         crate::history::local_iso_now(), audio.len() as f64 / RATE as f64, t.elapsed().as_secs_f64() * 1000.0));
     drop(level);
     let _ = std::fs::remove_file(&level_path);
-    Ok(audio)
+    let early = early.finish(&ctx.log, &audio);
+    Ok((audio, early))
+}
+
+/// Runs the final pass in the background whenever the speaker pauses, on
+/// the audio so far. A pass whose snapshot covers all the speech is used at
+/// stop; one overtaken by new speech is dropped, and the next pause starts
+/// another. Correction is skipped when speech resumed during whisper, which
+/// keeps Groq requests (rate-limited per minute) to about one per pause.
+struct EarlyWorker {
+    pass: Option<Arc<FinalPass>>,
+    /// A chunk whose peak is at or above this (dBFS) is speech.
+    level: f32,
+    pause_samples: usize,
+    /// End of the last speech chunk, shared with the running pass.
+    speech_end: Arc<AtomicUsize>,
+    running: Option<(usize, JoinHandle<Option<EarlyPass>>)>,
+    /// A finished pass and the audio length it covered.
+    done: Option<(usize, EarlyPass)>,
+    spoke: bool,
+}
+
+impl EarlyWorker {
+    fn new(ctx: &Ctx) -> Self {
+        let on = ctx.c("DICTATE_EARLY", "1") == "1";
+        Self {
+            pass: on.then(|| Arc::new(FinalPass::new(ctx))),
+            level: ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0),
+            pause_samples: ctx.c("DICTATE_EARLY_PAUSE_MS", "500").parse::<usize>().unwrap_or(500) * RATE as usize / 1000,
+            speech_end: Arc::new(AtomicUsize::new(0)),
+            running: None,
+            done: None,
+            spoke: false,
+        }
+    }
+
+    /// Called after each chunk is appended to `audio`.
+    fn heard(&mut self, audio: &[i16]) {
+        let Some(pass) = &self.pass else { return };
+        let chunk = RATE as usize * CHUNK_MS / 1000;
+        let tail = &audio[audio.len().saturating_sub(chunk)..];
+        if wav::peak_db(tail) >= self.level {
+            self.spoke = true;
+            self.speech_end.store(audio.len(), Ordering::SeqCst);
+            return;
+        }
+        if self.running.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            let (len, h) = self.running.take().unwrap();
+            if let Ok(Some(e)) = h.join() {
+                self.done = Some((len, e));
+            }
+        }
+        let speech_end = self.speech_end.load(Ordering::SeqCst);
+        let covered = self.done.as_ref().map_or(0, |(len, _)| *len).max(self.running.as_ref().map_or(0, |(len, _)| *len));
+        if !self.spoke || self.running.is_some() || covered >= speech_end || audio.len() - speech_end < self.pause_samples {
+            return;
+        }
+        let (pass, samples, speech) = (pass.clone(), audio.to_vec(), self.speech_end.clone());
+        let len = samples.len();
+        self.running = Some((len, std::thread::spawn(move || {
+            let raw = pass.whisper(&samples).ok()?;
+            let clean = crate::text::clean_whisper_text(&raw);
+            let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
+                None
+            } else {
+                pass.correct(&clean).and_then(Result::ok)
+            };
+            Some(EarlyPass { raw, clean, corrected })
+        })));
+    }
+
+    /// The pass to use at stop: one covering all the speech, waiting for it
+    /// if it is still running.
+    fn finish(mut self, log: &Path, audio: &[i16]) -> Option<EarlyPass> {
+        let speech_end = self.speech_end.load(Ordering::SeqCst);
+        let secs = |n: usize| n as f64 / RATE as f64;
+        let t = Instant::now();
+        if let Some((len, h)) = self.running.take() {
+            if len >= speech_end {
+                if let Ok(Some(e)) = h.join() {
+                    self.done = Some((len, e));
+                }
+            }
+        }
+        let used = self.done.filter(|(len, _)| *len >= speech_end && self.spoke);
+        if self.pass.is_some() && self.spoke {
+            let what = match &used {
+                Some((len, e)) => format!("early pass used ({:.1} of {:.1} s, waited {:.0} ms, corrected {})",
+                    secs(*len), secs(audio.len()), t.elapsed().as_secs_f64() * 1000.0, e.corrected.is_some()),
+                None => format!("no early pass (speech until {:.1} of {:.1} s)", secs(speech_end), secs(audio.len())),
+            };
+            append_log(log, &format!("{} daemon: {what}", crate::history::local_iso_now()));
+        }
+        used.map(|(_, e)| e)
+    }
 }
 
 struct Publisher<'a> {
