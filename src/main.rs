@@ -121,7 +121,10 @@ fn main() -> anyhow::Result<()> {
             pipeline::cmd_start(&c, mode.as_deref() == Some("llm"))?;
         }
         Command::Stop => {
-            pipeline::cmd_stop(&ctx()?)?;
+            let c = ctx()?;
+            let res = pipeline::cmd_stop(&c);
+            pipeline::log_release_summary(&c);
+            res?;
         }
         Command::Toggle => {
             pipeline::cmd_toggle(&ctx()?)?;

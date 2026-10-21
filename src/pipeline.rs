@@ -124,6 +124,16 @@ impl Ctx {
     fn terms(&self) -> String {
         self.cfg.get("DICTATE_TERMS").map(str::to_string).unwrap_or_else(|| self.c("DICTATE_PROMPT", ""))
     }
+    /// What produces the final text, shown on the overlay.
+    pub(crate) fn final_label(&self) -> String {
+        let whisper = Path::new(&self.model()).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut label = format!("Rust \u{b7} final: whisper {}", whisper.trim_start_matches("ggml-"));
+        if self.c("DICTATE_CORRECT", "0") == "1" {
+            let model = self.c("DICTATE_CORRECT_MODEL", crate::correct::DEFAULT_MODEL);
+            label += &format!(" + {}", model.rsplit('/').next().unwrap_or(&model));
+        }
+        label
+    }
     fn server(&self) -> String {
         // Explicit empty forces CLI; unset means default URL.
         self.cfg.get("DICTATE_SERVER").unwrap_or("http://127.0.0.1:8127").to_string()
@@ -191,6 +201,10 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
         label,
         text,
         tentative: String::new(),
+        engine: match phase {
+            crate::overlay::Phase::Recording => "Rust \u{b7} live: whisper snapshots".to_string(),
+            _ => ctx.final_label(),
+        },
         audio: ctx.paths.raw.display().to_string(),
         channels: ctx.channels(),
         channel: ctx.chan(),
@@ -450,6 +464,23 @@ pub fn server_up(server: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One timestamped line per `stop` in the log: each stage's time since the
+/// previous mark, so slow dictations can be explained after the fact (the
+/// TSV itself is rewritten on every release).
+pub fn log_release_summary(ctx: &Ctx) {
+    let Ok(tsv) = std::fs::read_to_string(&ctx.paths.release_timing) else { return };
+    let marks: Vec<(&str, f64)> = tsv.lines().skip(1)
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(e, t)| Some((e, t.parse().ok()?)))
+        .collect();
+    let (Some(first), Some(last)) = (marks.first(), marks.last()) else { return };
+    let stages: Vec<String> = marks.windows(2)
+        .map(|w| format!("{} +{:.0}", w[1].0, (w[1].1 - w[0].1) * 1000.0))
+        .collect();
+    append_log(&ctx.log, &format!("{} release {:.0} ms: {}",
+        crate::history::local_iso_now(), (last.1 - first.1) * 1000.0, stages.join(", ")));
+}
+
 /// Spawn the preview scheduler detached (phase 1: re-exec this binary's
 /// `preview-worker` hidden subcommand so all logic stays in Rust).
 fn spawn_preview(ctx: &Ctx) {
@@ -588,7 +619,9 @@ fn finish_stop(ctx: &Ctx) -> Result<()> {
         let _ = std::fs::remove_file(&ctx.paths.startfile);
     }
 
-    let dur = ffprobe_duration(&ctx.paths.wav);
+    let dur = wav::read_mono16(&ctx.paths.wav)
+        .map(|s| s.len() as f64 / wav::RATE as f64)
+        .unwrap_or_else(|_| ffprobe_duration(&ctx.paths.wav));
     if is_too_short(dur) {
         if let Some(e) = &entry {
             ctx.history.set_status(e, "too-short");
@@ -663,7 +696,11 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
         }
     }
 
-    let peak = ctx.audio().measure_peak_db(wav);
+    // Measured in-process for our own 16 kHz clips; ffmpeg cost ~100 ms here.
+    let peak = match wav::read_mono16(wav) {
+        Ok(s) => Some(wav::peak_db(&s)),
+        Err(_) => ctx.audio().measure_peak_db(wav),
+    };
     let feed: PathBuf = if ctx.c("DICTATE_FILTER", "").is_empty() {
         wav.to_path_buf()
     } else if apply_filter(wav, &ctx.paths.wav_proc, &ctx.c("DICTATE_FILTER", ""), &ctx.log) {
@@ -695,7 +732,7 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
             };
             transcribe::transcribe_parakeet(&feed, &pc, &ctx.log)
         }
-        Engine::Whisper => transcribe_whisper_pieces(ctx, &feed, &whisper),
+        Engine::Whisper => transcribe_whisper_pieces(ctx, &feed, &whisper, min_peak),
     };
     let Ok(raw_text) = raw_text else {
         if let Some(e) = entry {
@@ -772,7 +809,8 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str) -
 
 /// Long clips go to whisper in pieces cut at pauses (see
 /// `wav::WHISPER_PIECE_SECS`); a clip that cannot be read here goes whole.
-fn transcribe_whisper_pieces(ctx: &Ctx, wav_path: &Path, cfg: &WhisperConfig) -> Result<String> {
+/// Silent pieces are skipped: whisper invents "Thank you." for silence.
+fn transcribe_whisper_pieces(ctx: &Ctx, wav_path: &Path, cfg: &WhisperConfig, min_peak: f64) -> Result<String> {
     let samples = match wav::read_mono16(wav_path) {
         Ok(s) => s,
         Err(_) => return transcribe::transcribe_whisper(wav_path, cfg, &ctx.log),
@@ -783,6 +821,9 @@ fn transcribe_whisper_pieces(ctx: &Ctx, wav_path: &Path, cfg: &WhisperConfig) ->
     }
     let mut texts = Vec::new();
     for (i, range) in pieces.into_iter().enumerate() {
+        if is_silence(Some(wav::peak_db(&samples[range.clone()])), min_peak) {
+            continue;
+        }
         let piece = ctx.paths.datadir.join(format!("dictate-piece-{}-{i}.wav", std::process::id()));
         wav::write_mono16(&piece, &samples[range])?;
         let text = transcribe::transcribe_whisper(&piece, cfg, &ctx.log);

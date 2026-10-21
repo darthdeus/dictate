@@ -92,6 +92,12 @@ pub fn split_at_pauses(samples: &[i16], max_secs: f64) -> Vec<Range<usize>> {
     out
 }
 
+/// Peak level in dBFS, as ffmpeg volumedetect reports it (-91 for silence).
+pub fn peak_db(samples: &[i16]) -> f32 {
+    let peak = samples.iter().map(|&s| (s as i32).unsigned_abs()).max().unwrap_or(0);
+    if peak == 0 { -91.0 } else { 20.0 * (peak as f32 / 32768.0).log10() }
+}
+
 fn energy(block: &[i16]) -> u64 {
     block.iter().map(|&s| (s as i64 * s as i64) as u64).sum()
 }

@@ -252,8 +252,8 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     let _ = child.wait();
     let t = Instant::now();
     stream.finalize()?;
-    append_log(&ctx.log, &format!("dictate daemon: {:.1}s captured, finalize {:.0} ms",
-        audio.len() as f64 / RATE as f64, t.elapsed().as_secs_f64() * 1000.0));
+    append_log(&ctx.log, &format!("{} daemon: {:.1}s captured, finalize {:.0} ms",
+        crate::history::local_iso_now(), audio.len() as f64 / RATE as f64, t.elapsed().as_secs_f64() * 1000.0));
     drop(level);
     let _ = std::fs::remove_file(&level_path);
     Ok(audio)
@@ -275,6 +275,7 @@ impl Publisher<'_> {
             phase: Phase::Recording,
             label: "Listening".into(),
             text: committed.trim_start().to_string(),
+            engine: live_label(self.ctx),
             tentative: if committed.trim().is_empty() { tentative.trim_start() } else { tentative }.to_string(),
             audio: self.level_path.display().to_string(),
             channels: 1,
@@ -284,6 +285,13 @@ impl Publisher<'_> {
         };
         let _ = JsonFileOverlay { state_path: self.ctx.overlay_path.clone() }.show(&msg);
     }
+}
+
+fn live_label(ctx: &Ctx) -> String {
+    let model = stream_model(ctx);
+    let stem = Path::new(&model).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let lookahead = (right_context(ctx) + 1) * 80;
+    format!("Rust \u{b7} live: {} ({lookahead} ms lookahead)", stem.replace("-speech-streaming", ""))
 }
 
 fn log_stdio(log: &Path) -> Stdio {

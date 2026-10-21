@@ -290,7 +290,10 @@ class Overlay(Gtk.Window):
         cr.fill()
         hint = {"recording": "Release Caps Lock to transcribe", "processing": "Finishing your dictation",
                 "success": "Ready", "error": "Check dictation status"}[phase]
-        self.text(cr, hint, 32, self.h-39, 15, (0.48, 0.54, 0.62))
+        # Which implementation and models are working: Rust messages name
+        # them; the Bash script sends none.
+        engine = self.state.get("engine") or f"Bash \u00b7 {hint}"
+        self.text(cr, engine, 32, self.h-39, 15, (0.48, 0.54, 0.62), self.w-64-(230 if phase == "recording" else 90))
         if phase == "recording":
             for i, value in enumerate(self.levels):
                 height = 3+value*25
