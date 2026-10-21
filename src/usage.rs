@@ -119,14 +119,14 @@ pub fn summarize(state_dir: &Path, days: f64) -> Result<String> {
     let calls: Vec<ApiCall> = read(&state_dir.join("usage.jsonl"), since, |c: &ApiCall| c.ts);
     let dictations: Vec<Dictation> = read(&state_dir.join("metrics.jsonl"), since, |d: &Dictation| d.ts);
     let mut out = format!("Last {days} days: {} dictations, {:.1} min of audio\n\n",
-        dictations.len(), dictations.iter().map(|d| d.audio_secs).sum::<f64>() / 60.0);
+        dictations.len(), dictations.iter().map(|d| d.audio_secs).sum::<f64>() / 60.0 + 0.0);
 
     out += "Cost (USD)             requests  pause/final  audio min  tokens in/out      cost\n";
     let mut by: BTreeMap<String, Vec<&ApiCall>> = BTreeMap::new();
     for c in &calls {
         by.entry(format!("{} {}", c.api, c.model.rsplit('/').next().unwrap_or(&c.model))).or_default().push(c);
     }
-    let total: f64 = calls.iter().map(|c| c.usd).sum();
+    let total: f64 = calls.iter().map(|c| c.usd).sum::<f64>() + 0.0;
     for (name, cs) in &by {
         let early = cs.iter().filter(|c| c.purpose == "early").count();
         let audio: f64 = cs.iter().map(|c| c.audio_secs).sum();
@@ -141,15 +141,17 @@ pub fn summarize(state_dir: &Path, days: f64) -> Result<String> {
             total / dictations.len() as f64, if audio_h > 0.0 { total / audio_h } else { 0.0 });
     }
 
-    out += "\nSpeed by setup (ms)            n  release p50/p90  recognizer p50  correction p50  paste p50  pause pass\n";
     let mut setups: BTreeMap<&str, Vec<&Dictation>> = BTreeMap::new();
     for d in &dictations {
         setups.entry(d.setup.trim_start_matches("Rust \u{b7} final: ")).or_default().push(d);
     }
+    let w = setups.keys().map(|k| k.chars().count()).max().unwrap_or(0).max(19);
+    out += &format!("\n{:<w$} {:>4}  release p50/p90  recognizer p50  correction p50  paste p50  pause pass\n",
+        "Speed by setup (ms)", "n");
     for (setup, ds) in setups {
         let col = |f: fn(&Dictation) -> Option<f64>| pct(ds.iter().filter_map(|d| f(d)).collect(), 0.5);
         let early = ds.iter().filter(|d| d.early_used).count();
-        out += &format!("{setup:<28} {:>3}  {:>7}/{:<7}  {:>14}  {:>14}  {:>9}  {:>4}/{}\n", ds.len(),
+        out += &format!("{setup:<w$} {:>4}  {:>7}/{:<7}  {:>14}  {:>14}  {:>9}  {:>4}/{}\n", ds.len(),
             ms(pct(ds.iter().map(|d| d.total_ms).collect(), 0.5)), ms(pct(ds.iter().map(|d| d.total_ms).collect(), 0.9)),
             ms(col(|d| d.recognizer_ms)), ms(col(|d| d.correction_ms)), ms(col(|d| d.paste_ms)), early, ds.len());
     }
