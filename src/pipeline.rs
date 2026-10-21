@@ -706,7 +706,7 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
     let mut parts = vec![format!("{:.2} s total", now_unix() - ctx.command_started)];
     if at("early_pass_used").is_some() {
-        parts.push("final pass done during your pause".into());
+        parts.push("final pass done during pause".into());
     } else if let Some(ms) = span("transcription_started", "transcription_finished") {
         let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
         parts.push(format!("{engine} {ms:.0} ms"));
@@ -729,11 +729,12 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
         correction_ms: at("early_pass_used").is_none().then(|| span("correction_started", "correction_finished")).flatten(),
         paste_ms: span("text_ready", "delivery_returned"),
     });
-    let mut stats = parts.join(" \u{b7} ");
+    // One stage per line: the card shows only these, so they must be readable at a glance.
+    let mut stats = parts.join("\n");
     if let Some(id) = entry.and_then(|e| e.file_name()) {
         stats += &format!("\n{}", id.to_string_lossy());
     }
-    let secs = ctx.c("DICTATE_OSD_DONE_MS", "5000").parse::<f64>().unwrap_or(5000.0) / 1000.0;
+    let secs = ctx.c("DICTATE_OSD_DONE_MS", "8000").parse::<f64>().unwrap_or(5000.0) / 1000.0;
     let msg = OverlayMessage {
         phase: crate::overlay::Phase::Success,
         label: label.into(),

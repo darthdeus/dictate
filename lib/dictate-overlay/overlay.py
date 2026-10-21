@@ -44,7 +44,15 @@ def compact(state):
     return state.get("phase") in ("success", "error")
 
 
-COMPACT_W = 640
+COMPACT_W = 480
+# The success card shows only how the dictation went (the text is already
+# pasted), large enough to read at a glance.
+STATS_SIZE = 22
+FOOT_SIZE = 15
+
+
+def card_text(state):
+    return "" if state.get("phase") == "success" else state.get("text", "")
 
 
 def rounded(cr, x, y, w, h, r):
@@ -151,11 +159,11 @@ class Overlay(Gtk.Window):
         return layout.get_pixel_size()[1]
 
     def card_foot(self):
-        return "\n".join(line for line in (self.state.get("stats", ""), self.state.get("engine") or "Bash") if line)
+        return self.state.get("stats", "")
 
     def fit_text(self, reset=False):
         small = compact(self.state)
-        layout = self.area.create_pango_layout(self.state.get("text", ""))
+        layout = self.area.create_pango_layout(card_text(self.state) if compact(self.state) else self.state.get("text", ""))
         font = Pango.FontDescription()
         font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
         font.set_absolute_size((18 if small else self.size)*Pango.SCALE)
@@ -164,8 +172,12 @@ class Overlay(Gtk.Window):
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         _, text_height = layout.get_pixel_size()
         if small:
-            foot = self.measure(self.card_foot(), 13)
-            desired = min(int(self.monitor_rect.height*0.4), text_height + foot + 86)
+            foot = self.measure(self.card_foot(), STATS_SIZE)
+            if not card_text(self.state):
+                text_height = 0
+            engine = self.state.get("engine", "")
+            foot += self.measure(engine, FOOT_SIZE)+6 if engine else 0
+            desired = min(int(self.monitor_rect.height*0.5), text_height + foot + 86)
             self.target_h = desired
             self.y = self.base_y
             self.resize(self.w, self.target_h)
@@ -305,10 +317,15 @@ class Overlay(Gtk.Window):
         cr.fill()
         self.text(cr, self.state.get("label", "Ready").upper(), 54, 21, 15, accent, self.w-90, bold=True)
         foot = self.card_foot()
-        foot_h = self.measure(foot, 13)
-        self.text(cr, self.state.get("text", ""), 32, 56, 18, (0.89, 0.92, 0.96), self.w-64,
-                  height=self.h-86-foot_h)
-        self.text(cr, foot, 32, self.h-20-foot_h, 13, (0.48, 0.54, 0.62), self.w-64, height=foot_h)
+        foot_h = self.measure(foot, STATS_SIZE)
+        engine = self.state.get("engine", "")
+        engine_h = self.measure(engine, FOOT_SIZE) if engine else 0
+        body = card_text(self.state)
+        if body:
+            self.text(cr, body, 32, 56, 18, (0.89, 0.92, 0.96), self.w-64, height=self.h-86-foot_h-engine_h)
+        self.text(cr, foot, 32, self.h-26-foot_h-engine_h, STATS_SIZE, (0.89, 0.92, 0.96), self.w-64, height=foot_h)
+        if engine:
+            self.text(cr, engine, 32, self.h-20-engine_h, FOOT_SIZE, (0.48, 0.54, 0.62), self.w-64, height=engine_h)
 
     def draw(self, _, cr):
         now = time.monotonic()
