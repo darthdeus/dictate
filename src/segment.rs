@@ -17,14 +17,15 @@ pub const CHUNK: usize = RATE as usize * 160 / 1000;
 /// with the glossary prompt in front.
 pub const CONTEXT_CHARS: usize = 200;
 
-/// Default `DICTATE_SEGMENT_MIN_MS`: a cut is kept once the segment before it
-/// holds this much audio up to its last speech. On 100 saved dictations
-/// (whisper large-v3-turbo, word errors against the clip's reference, see
-/// `dictate segbench`), cutting at every pause cost 3.3% vs 1.7% for whole
-/// clips; at 3 s 2.8%, at 6 s 2.7%. Shorter segments still get a
-/// speculative pass, so pausing at the end stays instant; their audio is
-/// sent again when speech resumes (1.3x the audio at 6 s, measured on the
-/// same clips, against 4.4x for resending the whole recording per pause).
+/// Default `DICTATE_SEGMENT_MIN_MS` with whisper: a cut is kept once the
+/// segment before it holds this much audio up to its last speech. On 90
+/// saved dictations (whisper large-v3-turbo, word errors against what was
+/// pasted, see `dictate segbench`), cutting at every pause cost 3.3% vs
+/// 1.7% for whole clips; at 3 s 2.8%, at 6 s 2.7%. Shorter segments still
+/// get a speculative pass, so pausing at the end stays instant; their audio
+/// is recognized again when speech resumes (about 1.3-1.5x the audio, still
+/// free with local whisper). ElevenLabs defaults to 0: every cut kept, each
+/// second sent once.
 pub const MIN_SEGMENT_MS: &str = "6000";
 
 /// A sample position inside the pause `[speech_end, audio.len())`: the

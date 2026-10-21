@@ -350,13 +350,12 @@ struct Done {
 impl EarlyWorker {
     fn new(ctx: &Ctx) -> Self {
         let on = ctx.c("DICTATE_EARLY", "1") == "1";
-        let ms = |key: &str, default: &str| ctx.c(key, default).parse::<usize>().unwrap_or(default.parse().unwrap()) * RATE as usize / 1000;
         Self {
             pass: on.then(|| Arc::new(FinalPass::new(ctx, "early"))),
             incremental: ctx.c("DICTATE_INCREMENTAL", "1") == "1",
             level: ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0),
-            pause_samples: ms("DICTATE_EARLY_PAUSE_MS", "500"),
-            min_segment: ms("DICTATE_SEGMENT_MIN_MS", crate::segment::MIN_SEGMENT_MS),
+            pause_samples: ctx.c("DICTATE_EARLY_PAUSE_MS", "500").parse::<usize>().unwrap_or(500) * RATE as usize / 1000,
+            min_segment: ctx.min_segment(),
             speech_end: Arc::new(AtomicUsize::new(0)),
             running: None,
             done: None,

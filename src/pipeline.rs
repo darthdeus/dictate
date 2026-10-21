@@ -145,6 +145,13 @@ impl Ctx {
         }
         label
     }
+    /// `DICTATE_SEGMENT_MIN_MS` in samples (see `segment::MIN_SEGMENT_MS`).
+    /// ElevenLabs is billed per second sent and takes no text context, so
+    /// with it every pause cut is kept by default and each second is sent once.
+    pub(crate) fn min_segment(&self) -> usize {
+        let default = if self.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "0" } else { crate::segment::MIN_SEGMENT_MS };
+        self.c("DICTATE_SEGMENT_MIN_MS", default).parse::<usize>().unwrap_or(default.parse().unwrap()) * wav::RATE as usize / 1000
+    }
     fn server(&self) -> String {
         // Explicit empty forces CLI; unset means default URL.
         self.cfg.get("DICTATE_SERVER").unwrap_or("http://127.0.0.1:8127").to_string()
@@ -1880,9 +1887,8 @@ pub fn cmd_segbench(ctx: &Ctx, wavs: &[PathBuf], verbose: bool) -> Result<()> {
     use crate::correct::{edit_distance, words};
     let pass = FinalPass::new(ctx, "bench");
     let level: f32 = ctx.c("DICTATE_EARLY_LEVEL", "-30").parse().unwrap_or(-30.0);
-    let ms = |key: &str, default: &str| ctx.c(key, default).parse::<usize>().unwrap_or(default.parse().unwrap()) * wav::RATE as usize / 1000;
-    let pause = ms("DICTATE_EARLY_PAUSE_MS", "500");
-    let min = ms("DICTATE_SEGMENT_MIN_MS", crate::segment::MIN_SEGMENT_MS);
+    let pause = ctx.c("DICTATE_EARLY_PAUSE_MS", "500").parse::<usize>().unwrap_or(500) * wav::RATE as usize / 1000;
+    let min = ctx.min_segment();
     let mut total = [0usize; 4];
     println!("clip\tsecs\tsegments\tref_words\twhole\tsegmented\tsegmented+context");
     for path in wavs {

@@ -118,7 +118,10 @@ pause is ready on release. Each pause pass recognizes only the audio since
 the previous pause (cut inside the silence, with the text so far as whisper
 context) and the correction runs on the whole text, so every second of audio
 is recognized once and release only has to recognize what followed the last
-pause. `DICTATE_INCREMENTAL=0` makes each pause pass resend the whole
+pause. With whisper a cut is kept only once its segment holds
+`DICTATE_SEGMENT_MIN_MS` (6 s) of audio, since whisper is less accurate on
+short pieces; shorter ones get a speculative pass that is used if the pause
+was the end. `DICTATE_INCREMENTAL=0` makes each pause pass resend the whole
 recording instead. Without the daemon, `start`/`stop` record per
 process with a whisper snapshot preview.
 
