@@ -255,12 +255,14 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
             let _ = f.write_all(&bytes);
         }
         audio.extend_from_slice(&mono);
-        early.heard(&audio);
+        let t = stream.text();
+        let early_changed = early.heard(&audio, &t.committed, &t.tentative);
         let pcm: Vec<f32> = mono.iter().map(|&s| s as f32 / 32768.0).collect();
         let update = stream.feed(&pcm)?;
-        if update.committed_changed || update.tentative_changed {
+        if update.committed_changed || update.tentative_changed || early_changed {
             let t = stream.text();
-            overlay.show(&t.committed, &t.tentative);
+            let (committed, tentative) = early.preview(&t.committed, &t.tentative);
+            overlay.show(&committed, &tentative);
         }
     }
     let _ = child.kill();
@@ -287,9 +289,10 @@ struct EarlyWorker {
     pause_samples: usize,
     /// End of the last speech chunk, shared with the running pass.
     speech_end: Arc<AtomicUsize>,
-    running: Option<(usize, JoinHandle<Option<EarlyPass>>)>,
-    /// A finished pass and the audio length it covered.
-    done: Option<(usize, EarlyPass)>,
+    running: Option<(usize, usize, JoinHandle<Option<EarlyPass>>)>,
+    /// A finished pass, the audio length it covered and how many words of
+    /// the live text it replaces in the preview.
+    done: Option<(usize, usize, EarlyPass)>,
     spoke: bool,
 }
 
@@ -307,30 +310,27 @@ impl EarlyWorker {
         }
     }
 
-    /// Called after each chunk is appended to `audio`.
-    fn heard(&mut self, audio: &[i16]) {
-        let Some(pass) = &self.pass else { return };
+    /// Called after each chunk is appended to `audio`, with the live text so
+    /// far; true when a pass just finished (the preview changes).
+    fn heard(&mut self, audio: &[i16], committed: &str, tentative: &str) -> bool {
+        let Some(pass) = self.pass.clone() else { return false };
         let chunk = RATE as usize * CHUNK_MS / 1000;
         let tail = &audio[audio.len().saturating_sub(chunk)..];
         if wav::peak_db(tail) >= self.level {
             self.spoke = true;
             self.speech_end.store(audio.len(), Ordering::SeqCst);
-            return;
+            return self.collect();
         }
-        if self.running.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-            let (len, h) = self.running.take().unwrap();
-            if let Ok(Some(e)) = h.join() {
-                self.done = Some((len, e));
-            }
-        }
+        let finished = self.collect();
         let speech_end = self.speech_end.load(Ordering::SeqCst);
-        let covered = self.done.as_ref().map_or(0, |(len, _)| *len).max(self.running.as_ref().map_or(0, |(len, _)| *len));
+        let covered = self.done.as_ref().map_or(0, |d| d.0).max(self.running.as_ref().map_or(0, |r| r.0));
         if !self.spoke || self.running.is_some() || covered >= speech_end || audio.len() - speech_end < self.pause_samples {
-            return;
+            return finished;
         }
-        let (pass, samples, speech) = (pass.clone(), audio.to_vec(), self.speech_end.clone());
+        let words = committed.split_whitespace().count() + tentative.split_whitespace().count();
+        let (samples, speech) = (audio.to_vec(), self.speech_end.clone());
         let len = samples.len();
-        self.running = Some((len, std::thread::spawn(move || {
+        self.running = Some((len, words, std::thread::spawn(move || {
             let raw = pass.whisper(&samples).ok()?;
             let clean = crate::text::clean_whisper_text(&raw);
             let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
@@ -340,6 +340,38 @@ impl EarlyWorker {
             };
             Some(EarlyPass { raw, clean, corrected })
         })));
+        finished
+    }
+
+    /// Takes a finished pass; true if it produced a result.
+    fn collect(&mut self) -> bool {
+        if !self.running.as_ref().is_some_and(|r| r.2.is_finished()) {
+            return false;
+        }
+        let (len, words, h) = self.running.take().unwrap();
+        match h.join() {
+            Ok(Some(e)) => {
+                self.done = Some((len, words, e));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The preview: the latest pass's corrected text in place of the live
+    /// words it covered, then the live words spoken since.
+    fn preview(&self, committed: &str, tentative: &str) -> (String, String) {
+        let Some((_, words, e)) = &self.done else { return (committed.into(), tentative.into()) };
+        let fixed = e.corrected.as_deref().unwrap_or(&e.clean);
+        let c: Vec<&str> = committed.split_whitespace().collect();
+        let t: Vec<&str> = tentative.split_whitespace().collect();
+        let mut out = fixed.to_string();
+        for w in c.iter().skip(*words) {
+            out.push(' ');
+            out.push_str(w);
+        }
+        let tail = t.iter().skip(words.saturating_sub(c.len())).copied().collect::<Vec<_>>().join(" ");
+        (out, if tail.is_empty() { tail } else { format!(" {tail}") })
     }
 
     /// The pass to use at stop: one covering all the speech, waiting for it
@@ -348,14 +380,14 @@ impl EarlyWorker {
         let speech_end = self.speech_end.load(Ordering::SeqCst);
         let secs = |n: usize| n as f64 / RATE as f64;
         let t = Instant::now();
-        if let Some((len, h)) = self.running.take() {
+        if let Some((len, words, h)) = self.running.take() {
             if len >= speech_end {
                 if let Ok(Some(e)) = h.join() {
-                    self.done = Some((len, e));
+                    self.done = Some((len, words, e));
                 }
             }
         }
-        let used = self.done.filter(|(len, _)| *len >= speech_end && self.spoke);
+        let used = self.done.filter(|(len, _, _)| *len >= speech_end && self.spoke).map(|(len, _, e)| (len, e));
         if self.pass.is_some() && self.spoke {
             let what = match &used {
                 Some((len, e)) => format!("early pass used ({:.1} of {:.1} s, waited {:.0} ms, corrected {})",
