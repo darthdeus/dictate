@@ -33,6 +33,10 @@ pub struct OverlayMessage {
     /// Timings and history id of a finished dictation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stats: String,
+    /// Success only: the recognizer's text before correction, so the
+    /// renderer can show `text` with the corrected words highlighted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw: String,
     pub audio: String,
     pub channels: u32,
     pub channel: u32,
@@ -277,7 +281,7 @@ mod tests {
         let writer = JsonFileOverlay { state_path: dir.join("state.json") };
         let msg = OverlayMessage {
             phase: Phase::Recording, label: "Listening".into(), text: "hello".into(),
-            tentative: String::new(), engine: String::new(), stats: String::new(), audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
+            tentative: String::new(), engine: String::new(), stats: String::new(), raw: String::new(), audio: "/tmp/r.pcm".into(), channels: 1, channel: 0,
             duration: 300.0, expires: 1700000300.0,
         };
         writer.show(&msg).unwrap();
@@ -286,6 +290,12 @@ mod tests {
         assert!(body.contains("\"hello\""), "{body}");
         // No fixed tmp path remains (concurrent writers must not share one).
         assert!(std::fs::read_dir(&dir).unwrap().count() == 1);
+        // `raw` is optional on the wire: absent when empty, read back when set.
+        assert!(!body.contains("\"raw\""), "{body}");
+        let done = OverlayMessage { phase: Phase::Success, raw: "a div".into(), text: "a diff".into(), ..msg };
+        writer.show(&done).unwrap();
+        let back: OverlayMessage = serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!((back.raw.as_str(), back.text.as_str()), ("a div", "a diff"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

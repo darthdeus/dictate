@@ -59,10 +59,11 @@ Gtk.main()
         (tmp/"clicked").unlink()
         state = tmp/"state.json"
 
-        def update(phase, text, duration=10):
+        def update(phase, text, duration=10, **extra):
             new = tmp/"new.json"
-            new.write_text(json.dumps(dict(phase=phase, label=phase.title(), text=text,
-                expires=time.time()+duration, duration=duration, audio=str(tmp/"audio.pcm"), channels=10, channel=0)))
+            new.write_text(json.dumps({**dict(phase=phase, label=phase.title(), text=text,
+                expires=time.time()+duration, duration=duration, audio=str(tmp/"audio.pcm"), channels=10, channel=0),
+                **extra}))
             new.replace(state)
 
         update("recording", "A quieter panel, with room to follow your thoughts.")
@@ -95,8 +96,23 @@ Gtk.main()
         update("error", "Check the microphone.")
         assert wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd")) == hud
         time.sleep(0.1)
-        assert "HEIGHT=252" in xd("getwindowgeometry", "--shell", hud)
+        assert "WIDTH=480" in xd("getwindowgeometry", "--shell", hud)  # errors show as the compact card
         assert xd("getwindowfocus") == wid, "Remapping stole focus"
+        # A finished dictation with a correction: stats card plus the text panel.
+        update("success", "Okay, can you look at the dictate diff in CLAUDE.md and run a sub-agent?", 3,
+               label="Pasted", raw="Okay, can you look at the dictate div in Claude.md and run a sub agent?",
+               stats="total\t0.31\ts\nfinal pass\tin pause\t\ncorrection\t0.18\ts\naudio\t6.2\ts\n2026-10-22_11-00-00-1-0",
+               engine="Rust \u00b7 final: whisper large-v3-turbo + qwen3.8-27b")
+        both = wait_for(lambda: (lambda ids: ids if len(ids) == 2 else None)(
+            xd("search", "--onlyvisible", "--class", "dictate-osd").split()))
+        time.sleep(0.4)
+        assert xd("getwindowfocus") == wid, "Text panel stole focus"
+        if os.getenv("DICTATE_CHECK_DIFF_IMAGE"):
+            subprocess.run(["magick", "import", "-display", display, "-window", "root",
+                            os.environ["DICTATE_CHECK_DIFF_IMAGE"]], env=env, check=True)
+        wait_for(lambda: not xd("search", "--onlyvisible", "--class", "dictate-osd"))
+        update("processing", "Next one")
+        assert len(wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd")).split()) == 1
 
         spec = importlib.util.spec_from_file_location("overlay", source)
         module = importlib.util.module_from_spec(spec)
@@ -110,6 +126,15 @@ Gtk.main()
         assert changed("same words", "same words") == []
         assert changed("remove this word", "remove word") == []
         assert changed("Příliš 日本語", "Příliš krásné 日本語") == ["krásné"]
+        assert module.corrections("the dictate div in Claude.md", "the dictate diff in CLAUDE.md") == \
+            [("div", "diff"), ("Claude.md", "CLAUDE.md")]
+        assert module.corrections("run a sub agent now", "run a sub-agent now") == [("sub agent", "sub-agent")]
+        assert module.corrections("drop the the word", "drop the word") == [("the", "")]
+        assert module.corrections("same", "same") == []
+        assert module.wants("card", dict(phase="recording")) and module.wants("text", dict(phase="success", text="x"))
+        assert not module.wants("text", dict(phase="recording", text="x"))
+        assert not module.wants("text", dict(phase="success", text=""))
+        assert changed("the dictate div in Claude.md", "the dictate diff in CLAUDE.md") == ["diff", "CLAUDE.md"]
         recording = dict(phase="recording", text="Keep this preview")
         processing = module.next_state(recording, dict(phase="processing", text=""))
         assert processing["text"] == "Keep this preview"
@@ -132,7 +157,7 @@ Gtk.main()
         model.levels = [0.0]*36
         module.Overlay.sample_audio(model)
         assert model.levels[-1] == 0, "Meter read the wrong channel"
-        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges")
+        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges; correction text panel")
     finally:
         for process in reversed(processes):
             process.terminate()

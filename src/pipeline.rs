@@ -221,6 +221,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
         text,
         tentative: String::new(),
         stats: String::new(),
+        raw: String::new(),
         engine: match phase {
             crate::overlay::Phase::Recording => "Rust \u{b7} live: whisper snapshots".to_string(),
             _ => ctx.final_label(),
@@ -656,7 +657,7 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     notify(ctx, "\u{23f3} transcribing\u{2026}", "", 15000);
 
     let mode = ctx.state.take_mode();
-    let text = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early) {
+    let (raw, text) = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early) {
         Err(e) => {
             notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
             return Err(e);
@@ -674,7 +675,7 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
             notify(ctx, "dictate: discarded noise", &text, 2000);
             return Ok(());
         }
-        Ok(TextOutcome::Ready { text, .. }) => text,
+        Ok(TextOutcome::Ready { raw, text }) => (raw, text),
     };
 
     if ctx.c("DICTATE_NOTYPE", "0") == "1" {
@@ -682,14 +683,14 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
         if let Some(e) = &entry {
             ctx.history.set_status(e, "copied-to-clipboard");
         }
-        notify_done(ctx, "Copied to clipboard", &text, entry.as_deref(), dur);
+        notify_done(ctx, "Copied to clipboard", &raw, &text, entry.as_deref(), dur);
     } else {
         deliver_with(ctx, &text, prefetch);
         ctx.mark("delivery_returned");
         if let Some(e) = &entry {
             ctx.history.set_status(e, "delivery-attempted");
         }
-        notify_done(ctx, "Pasted", &text, entry.as_deref(), dur);
+        notify_done(ctx, "Pasted", &raw, &text, entry.as_deref(), dur);
     }
     if let Some(e) = &entry {
         spawn_shadow(ctx, e);
@@ -758,7 +759,7 @@ fn release_marks(ctx: &Ctx) -> Vec<(String, f64)> {
 
 /// The finished-dictation card: the text plus how long each stage took, the
 /// models and the history id, so a slow or wrong dictation can be looked up.
-fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_secs: f64) {
+fn notify_done(ctx: &Ctx, label: &str, raw: &str, text: &str, entry: Option<&Path>, audio_secs: f64) {
     let marks = release_marks(ctx);
     let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
@@ -812,6 +813,7 @@ fn notify_done(ctx: &Ctx, label: &str, text: &str, entry: Option<&Path>, audio_s
         tentative: String::new(),
         engine: ctx.final_label(),
         stats,
+        raw: raw.into(),
         audio: String::new(),
         channels: 1,
         channel: 0,

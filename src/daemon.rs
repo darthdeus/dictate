@@ -574,6 +574,7 @@ impl Publisher<'_> {
             text: committed.trim_start().to_string(),
             engine: live_label(self.ctx),
             stats: String::new(),
+            raw: String::new(),
             tentative: if committed.trim().is_empty() { tentative.trim_start() } else { tentative }.to_string(),
             audio: self.level_path.display().to_string(),
             channels: 1,
