@@ -98,19 +98,24 @@ Gtk.main()
         time.sleep(0.1)
         assert "WIDTH=480" in xd("getwindowgeometry", "--shell", hud)  # errors show as the compact card
         assert xd("getwindowfocus") == wid, "Remapping stole focus"
-        # A finished dictation with a correction: stats card plus the text panel.
-        update("success", "Okay, can you look at the dictate diff in CLAUDE.md and run a sub-agent?", 3,
+        # A finished dictation with a correction: one card, the changes above the stats.
+        update("success", "Okay, can you look at the dictate diff in CLAUDE.md and run a sub-agent?", 30,
                label="Pasted", raw="Okay, can you look at the dictate div in Claude.md and run a sub agent?",
                stats="total\t0.31\ts\nfinal pass\tin pause\t\ncorrection\t0.18\ts\naudio\t6.2\ts\n2026-10-22_11-00-00-1-0",
                engine="Rust \u00b7 final: whisper large-v3-turbo + qwen3.8-27b")
-        both = wait_for(lambda: (lambda ids: ids if len(ids) == 2 else None)(
-            xd("search", "--onlyvisible", "--class", "dictate-osd").split()))
+        card = wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd"))
+        assert len(card.split()) == 1, card
         time.sleep(0.4)
-        assert xd("getwindowfocus") == wid, "Text panel stole focus"
+        assert "WIDTH=480" in xd("getwindowgeometry", "--shell", card)
+        assert xd("getwindowfocus") == wid, "Card stole focus"
         if os.getenv("DICTATE_CHECK_DIFF_IMAGE"):
-            subprocess.run(["magick", "import", "-display", display, "-window", "root",
+            subprocess.run(["magick", "import", "-display", display, "-window", card,
                             os.environ["DICTATE_CHECK_DIFF_IMAGE"]], env=env, check=True)
-        wait_for(lambda: not xd("search", "--onlyvisible", "--class", "dictate-osd"))
+        (tmp/"clicked").unlink(missing_ok=True)
+        xd("mousemove", 1600-24-240, 60, "click", 1)
+        wait_for(lambda: not xd("search", "--onlyvisible", "--class", "dictate-osd"), timeout=3)
+        assert not (tmp/"clicked").exists(), "Click on the card reached the window below"
+        assert xd("getwindowfocus") == wid, "Dismissing the card changed focus"
         update("processing", "Next one")
         assert len(wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd")).split()) == 1
 
@@ -126,14 +131,20 @@ Gtk.main()
         assert changed("same words", "same words") == []
         assert changed("remove this word", "remove word") == []
         assert changed("Příliš 日本語", "Příliš krásné 日本語") == ["krásné"]
-        assert module.corrections("the dictate div in Claude.md", "the dictate diff in CLAUDE.md") == \
-            [("div", "diff"), ("Claude.md", "CLAUDE.md")]
-        assert module.corrections("run a sub agent now", "run a sub-agent now") == [("sub agent", "sub-agent")]
-        assert module.corrections("drop the the word", "drop the word") == [("the", "")]
-        assert module.corrections("same", "same") == []
-        assert module.wants("card", dict(phase="recording")) and module.wants("text", dict(phase="success", text="x"))
-        assert not module.wants("text", dict(phase="recording", text="x"))
-        assert not module.wants("text", dict(phase="success", text=""))
+        assert module.diff_snippets("the dictate div in Claude.md", "the dictate diff in CLAUDE.md") == \
+            ([[("ctx", "the dictate"), ("old", "div"), ("new", "diff"), ("ctx", "in"),
+               ("old", "Claude.md"), ("new", "CLAUDE.md")]], 0)
+        long = " ".join(f"w{i}" for i in range(40))
+        snippets, more = module.diff_snippets(long.replace("w20", "x"), long, context=2)
+        assert snippets == [[("ctx", "\u2026"), ("ctx", "w18 w19"), ("old", "x"), ("new", "w20"),
+                             ("ctx", "w21 w22"), ("ctx", "\u2026")]] and more == 0
+        assert module.diff_snippets("same", "same") == ([], 0)
+        many = module.diff_snippets(long.replace("w5 ", "a ").replace("w15", "b").replace("w25", "c")
+                                    .replace("w35", "d").replace("w38", "e"), long, limit=3)
+        assert len(many[0]) == 3 and many[1] == 1, many
+        text, ranges = module.diff_text(*module.diff_snippets("a div b", "a diff b"))
+        assert text == "a div diff b" and [text.encode()[s:e].decode() for s, e, _ in ranges] == ["div", "diff"]
+        assert module.diff_text([], 2) == ("\n+2 more", [])
         assert changed("the dictate div in Claude.md", "the dictate diff in CLAUDE.md") == ["diff", "CLAUDE.md"]
         recording = dict(phase="recording", text="Keep this preview")
         processing = module.next_state(recording, dict(phase="processing", text=""))
@@ -157,7 +168,7 @@ Gtk.main()
         model.levels = [0.0]*36
         module.Overlay.sample_audio(model)
         assert model.levels[-1] == 0, "Meter read the wrong channel"
-        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges; correction text panel")
+        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges; correction diff in the card; click dismisses the card")
     finally:
         for process in reversed(processes):
             process.terminate()

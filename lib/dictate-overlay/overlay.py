@@ -31,17 +31,53 @@ def changed_words(previous, current):
             if op in ("insert", "replace") and j < k]
 
 
-def corrections(raw, text):
-    """What the correction changed: ("before", "after") word runs, in order."""
+def diff_snippets(raw, text, context=3, limit=4):
+    """What the correction changed, as short snippets of ("ctx"|"old"|"new", words)
+    parts with `context` words around each change; changes closer than that
+    share a snippet. Returns (snippets, how many more were left out)."""
     before, after = raw.split(), text.split()
-    matcher = SequenceMatcher(None, before, after, autojunk=False)
-    return [(" ".join(before[i:j]), " ".join(after[k:l]))
-            for op, i, j, k, l in matcher.get_opcodes() if op != "equal"]
+    changes = [(i, j, k, l) for op, i, j, k, l in
+               SequenceMatcher(None, before, after, autojunk=False).get_opcodes() if op != "equal"]
+    groups = []
+    for change in changes:
+        if groups and change[2]-groups[-1][-1][3] <= 2*context:
+            groups[-1].append(change)
+        else:
+            groups.append([change])
+    snippets = []
+    for group in groups[:limit]:
+        start, end = max(0, group[0][2]-context), min(len(after), group[-1][3]+context)
+        parts = [("ctx", "\u2026")] if start > 0 else []
+        pos = start
+        for i, j, k, l in group:
+            if k > pos:
+                parts.append(("ctx", " ".join(after[pos:k])))
+            if j > i:
+                parts.append(("old", " ".join(before[i:j])))
+            if l > k:
+                parts.append(("new", " ".join(after[k:l])))
+            pos = l
+        if end > pos:
+            parts.append(("ctx", " ".join(after[pos:end])))
+        if end < len(after):
+            parts.append(("ctx", "\u2026"))
+        snippets.append(parts)
+    return snippets, len(groups)-len(snippets)
 
 
-def wants(role, state):
-    """The card window shows every phase; the text window only finished dictations."""
-    return role == "card" or (state.get("phase") == "success" and bool(state.get("text")))
+def diff_text(snippets, more):
+    """One line per snippet, plus UTF-8 byte ranges of the old/new parts."""
+    text, ranges = "", []
+    for n, parts in enumerate(snippets):
+        for m, (kind, words) in enumerate(parts):
+            text += ("\n" if n and not m else " " if m else "")
+            start = len(text.encode("utf-8"))
+            text += words
+            if kind != "ctx":
+                ranges.append((start, len(text.encode("utf-8")), kind))
+    if more:
+        text += f"\n+{more} more"
+    return text, ranges
 
 
 def next_state(previous, incoming):
@@ -52,10 +88,10 @@ def next_state(previous, incoming):
     return state
 
 
-def compact(state, role="card"):
-    """Finished and failed dictations show as a small card at the top right;
-    the text window shows the finished text as the full panel instead."""
-    return role == "card" and state.get("phase") in ("success", "error")
+def compact(state):
+    """Finished and failed dictations show as a small card at the top right
+    that a click dismisses."""
+    return state.get("phase") in ("success", "error")
 
 
 COMPACT_W = 480
@@ -64,6 +100,8 @@ COMPACT_W = 480
 STATS_SIZE = 22
 LABEL_SIZE = 17
 FOOT_SIZE = 14
+# What the correction changed, above the stats.
+DIFF_SIZE = 15
 ROW_H = 34
 DIM = (0.48, 0.54, 0.62)
 BRIGHT = (0.89, 0.92, 0.96)
@@ -78,7 +116,11 @@ def card_rows(state):
 
 
 def card_text(state):
-    return "" if state.get("phase") == "success" else state.get("text", "")
+    """Errors show their message; a finished dictation only what the
+    correction changed (the text itself is already pasted)."""
+    if state.get("phase") != "success":
+        return state.get("text", ""), []
+    return diff_text(*diff_snippets(state.get("raw") or state.get("text", ""), state.get("text", "")))
 
 
 def rounded(cr, x, y, w, h, r):
@@ -90,7 +132,7 @@ def rounded(cr, x, y, w, h, r):
 
 
 class Overlay(Gtk.Window):
-    def __init__(self, path, role="card"):
+    def __init__(self, path):
         # POPUP is override-redirect: i3 never manages/focuses this window.
         super().__init__(type=Gtk.WindowType.POPUP)
         self.set_wmclass("dictate-osd", "dictate-osd")
@@ -102,7 +144,6 @@ class Overlay(Gtk.Window):
         self.set_skip_pager_hint(True)
         self.set_decorated(False)
         self.path = Path(path)
-        self.role = role
         self.stamp = None
         self.state = {}
         self.changed_ranges = []
@@ -115,6 +156,7 @@ class Overlay(Gtk.Window):
         self.h = 252
         self.target_h = 252
         self.monitor_rect = None
+        self.accent = BRIGHT
         self.size = max(18, min(40, int(os.getenv("DICTATE_OSD_SIZE", "28"))))
         self.motion = os.getenv("DICTATE_OSD_MOTION", "1") != "0"
         self.set_default_size(self.w, self.h)
@@ -123,6 +165,8 @@ class Overlay(Gtk.Window):
         self.add(self.area)
         self.connect("realize", self.realized)
         self.connect("size-allocate", self.allocated)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("button-press-event", self.dismiss)
         GLib.timeout_add(33, self.tick)
 
     def realized(self, _):
@@ -134,6 +178,18 @@ class Overlay(Gtk.Window):
         self.input_shape_combine_region(cairo.Region())
         win.set_pass_through(True)
         self.reshape()
+
+    def clickable(self, on):
+        """Only the finished card takes clicks (to dismiss it); the live
+        panel stays click-through."""
+        self.input_shape_combine_region(None if on else cairo.Region())
+        if self.get_realized():
+            self.get_window().set_pass_through(not on)
+
+    def dismiss(self, *_):
+        self.hide()
+        self.last_seen = time.monotonic()
+        return True
 
     def allocated(self, _, allocation):
         if allocation.height != self.h:
@@ -162,15 +218,13 @@ class Overlay(Gtk.Window):
             monitor = display.get_monitor_at_point(x, y)
         rect = monitor.get_geometry()
         self.monitor_rect = rect
-        self.w = COMPACT_W if compact(self.state, self.role) else self.full_w
-        if compact(self.state, self.role):
+        self.w = COMPACT_W if compact(self.state) else self.full_w
+        self.clickable(compact(self.state))
+        if compact(self.state):
             self.x = rect.x + rect.width - self.w - 24
             self.base_y = rect.y + 24
         else:
             self.x = rect.x + (rect.width-self.w)//2
-            if self.role == "text":
-                # Beside the stats card (top right), never under it.
-                self.x = max(rect.x+24, min(self.x, rect.x+rect.width-COMPACT_W-48-self.w))
             # Top center, growing down: the middle of the screen is where you work.
             self.base_y = rect.y + 24
         if self.get_realized():
@@ -230,11 +284,12 @@ class Overlay(Gtk.Window):
         return y + len(rows)*ROW_H
 
     def fit_text(self, reset=False):
-        small = compact(self.state, self.role)
-        layout = self.area.create_pango_layout(card_text(self.state) if compact(self.state, self.role) else self.state.get("text", ""))
+        small = compact(self.state)
+        body = card_text(self.state)[0]
+        layout = self.area.create_pango_layout(body if small else self.state.get("text", ""))
         font = Pango.FontDescription()
         font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
-        font.set_absolute_size((18 if small else self.size)*Pango.SCALE)
+        font.set_absolute_size(((DIFF_SIZE if self.state.get("phase") == "success" else 18) if small else self.size)*Pango.SCALE)
         layout.set_font_description(font)
         layout.set_width((self.w-64)*Pango.SCALE)
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
@@ -243,7 +298,9 @@ class Overlay(Gtk.Window):
             rows, notes = card_rows(self.state)
             foot = len(rows)*ROW_H
             foot += self.measure(self.card_note(notes), FOOT_SIZE)+14 if self.card_note(notes) else 0
-            if not card_text(self.state):
+            if body:
+                text_height += 10  # gap above the stats
+            else:
                 text_height = 0
             desired = min(int(self.monitor_rect.height*0.5), text_height + foot + 86)
             self.target_h = desired
@@ -268,11 +325,7 @@ class Overlay(Gtk.Window):
             if stamp != self.stamp:
                 state = json.loads(self.path.read_text())
                 self.stamp = stamp
-                if not wants(self.role, state):
-                    self.state = state
-                    if self.get_visible():
-                        self.hide()
-                elif state["expires"] > time.time():
+                if state["expires"] > time.time():
                     was_recording = self.state.get("phase") == "recording"
                     previous = self.state if self.get_visible() else {}
                     state = next_state(previous, state)
@@ -285,7 +338,7 @@ class Overlay(Gtk.Window):
                         self.born = now
                         self.levels = [0.0] * 36
                     reset = not self.get_visible() or (state["phase"] == "recording" and not was_recording)
-                    if self.get_visible() and compact(state, self.role) != compact(previous, self.role):
+                    if self.get_visible() and compact(state) != compact(previous):
                         # The panel becomes the card (or back): move it, as if new.
                         self.hide()
                     if not self.get_visible():
@@ -315,7 +368,7 @@ class Overlay(Gtk.Window):
                 if self.frame % 30 == 0:
                     self.get_window().raise_()
                 self.frame += 1
-        elif self.role == "card" and now-self.last_seen > 60:
+        elif now-self.last_seen > 60:
             Gtk.main_quit()
             return False
         return True
@@ -347,7 +400,7 @@ class Overlay(Gtk.Window):
         self.levels = self.levels[1:] + [value]
 
     def text(self, cr, text, x, y, size, color, width=None, lines=1, bold=False, height=None, changes=None,
-             dim_from=None):
+             dim_from=None, diff=None):
         layout = PangoCairo.create_layout(cr)
         font = Pango.FontDescription()
         font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
@@ -365,6 +418,13 @@ class Overlay(Gtk.Window):
             ranges, tint = changes
             for start, end in ranges:
                 attr = Pango.attr_foreground_new(*(round(c*65535) for c in tint))
+                attr.start_index, attr.end_index = start, end
+                attributes.insert(attr)
+        for start, end, kind in diff or []:
+            # Correction diff: replaced words struck through and dim, new ones in the accent.
+            tint = DIM if kind == "old" else self.accent
+            style = Pango.attr_strikethrough_new(True) if kind == "old" else Pango.attr_weight_new(Pango.Weight.BOLD)
+            for attr in (style, Pango.attr_foreground_new(*(round(c*65535) for c in tint))):
                 attr.start_index, attr.end_index = start, end
                 attributes.insert(attr)
         if dim_from is not None:
@@ -387,13 +447,20 @@ class Overlay(Gtk.Window):
         cr.set_source_rgb(*accent)
         cr.arc(37, 33, 5, 0, math.tau)
         cr.fill()
-        self.text(cr, self.state.get("label", "Ready").upper(), 54, 21, 15, accent, self.w-90, bold=True)
+        body, ranges = card_text(self.state)
+        label = self.state.get("label", "Ready").upper()
+        if self.state.get("phase") == "success":
+            fixed = sum(1 for _, _, kind in ranges if kind == "new")
+            label += f"  \u00b7  {fixed} FIXED" if fixed else ""
+        self.text(cr, label, 54, 21, 15, accent, self.w-90, bold=True)
         rows, notes = card_rows(self.state)
         note = self.card_note(notes)
         note_h = self.measure(note, FOOT_SIZE) if note else 0
-        body = card_text(self.state)
         if body:
-            self.text(cr, body, 32, 56, 18, BRIGHT, self.w-64, height=self.h-86-len(rows)*ROW_H-note_h)
+            self.accent = accent
+            size = DIFF_SIZE if self.state.get("phase") == "success" else 18
+            self.text(cr, body, 32, 56, size, BRIGHT if size == 18 else (0.70, 0.75, 0.82), self.w-64,
+                      height=self.h-86-len(rows)*ROW_H-note_h, diff=ranges)
         self.draw_rows(cr, rows, self.h-20-note_h-(14 if note else 0)-len(rows)*ROW_H, accent)
         if note:
             self.text(cr, note, 32, self.h-20-note_h, FOOT_SIZE, DIM, self.w-64, height=note_h)
@@ -403,7 +470,7 @@ class Overlay(Gtk.Window):
         phase = self.state.get("phase", "recording")
         accent = {"recording": (0.40, 0.88, 0.73), "processing": (0.65, 0.64, 1.0),
                   "success": (0.40, 0.88, 0.73), "error": (1.0, 0.63, 0.46)}[phase]
-        if compact(self.state, self.role):
+        if compact(self.state):
             self.draw_card(cr, accent)
             return False
         cr.set_source_rgb(0.055, 0.067, 0.09)
@@ -416,8 +483,6 @@ class Overlay(Gtk.Window):
         cr.set_source_rgba(*accent, pulse)
         cr.arc(37, 37, 5, 0, math.tau)
         cr.fill()
-        fixes = corrections(self.state.get("raw", ""), self.state.get("text", "")) \
-            if self.role == "text" and self.state.get("raw") else []
         label = self.state.get("label", "Listening")
         self.text(cr, label.upper(), 54, 24, 17, accent, self.w-240, bold=True)
         if phase == "recording":
@@ -426,7 +491,7 @@ class Overlay(Gtk.Window):
         elif phase == "processing":
             meta = "WORKING"
         else:
-            meta = f"{len(fixes)} FIXED" if fixes else "DICTATION"
+            meta = "DICTATION"
         self.text(cr, meta, self.w-177, 25, 15, (0.48, 0.54, 0.62))
         body = self.state.get("text", "")
         tentative = self.state.get("tentative", "")
@@ -437,9 +502,6 @@ class Overlay(Gtk.Window):
         fade = min(1, (now-self.changed)/0.14) if self.motion else 1
         color = tuple(a+(b-a)*fade for a, b in zip((0.30, 0.35, 0.41), (0.89, 0.92, 0.96)))
         changes = (self.changed_ranges, color) if fade < 1 else None
-        if fixes:
-            # Corrected words stay in the accent colour for the whole display.
-            changes = (changed_words(self.state["raw"], self.state.get("text", "")), accent)
         self.text(cr, body, 32, 68, self.size, (0.89, 0.92, 0.96), self.w-64, 3,
                   height=self.h-139, changes=changes, dim_from=dim_from)
         cr.set_source_rgb(0.14, 0.17, 0.21)
@@ -450,9 +512,6 @@ class Overlay(Gtk.Window):
         # Which implementation and models are working: Rust messages name
         # them; the Bash script sends none.
         engine = self.state.get("engine") or f"Bash \u00b7 {hint}"
-        if self.role == "text":
-            pairs = ["%s \u2192 %s" % (a or "\u2205", b or "\u2205") for a, b in fixes]
-            engine = "fixed: " + "  \u00b7  ".join(pairs) if pairs else "no corrections"
         self.text(cr, engine, 32, self.h-39, 15, (0.48, 0.54, 0.62), self.w-64-(230 if phase == "recording" else 90))
         if phase == "recording":
             for i, value in enumerate(self.levels):
@@ -476,7 +535,4 @@ class Overlay(Gtk.Window):
 
 if __name__ == "__main__":
     overlay = Overlay(sys.argv[1])
-    # Second window: after release, the pasted text at the top with the
-    # corrected words highlighted, next to the stats card.
-    text_panel = Overlay(sys.argv[1], role="text")
     Gtk.main()
