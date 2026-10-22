@@ -17,6 +17,9 @@
 //! ModelRun and DeepInfra were cheapest ($0.20/$0.15 per 1M in, ~$0.0001 a
 //! correction) and fastest (~345 ms median vs Groq ~200 ms), Cerebras next. `DICTATE_CORRECT_FALLBACK=0`
 //! turns it off; without `OPENROUTER_API_KEY` there is no fallback.
+//! `mishearings.txt` next to the keys file (`heard -> meant` per line, `#`
+//! comments) is appended to the prompt as known recognizer mistakes.
+//!
 //! A 429 parks that endpoint for its `retry-after` (Groq: until the daily
 //! tokens recover) in `correct-skip.txt`, shared by `stop` and the daemon,
 //! so later corrections go straight to the fallback instead of re-asking.
@@ -101,7 +104,7 @@ impl Corrector {
         Ok(Self {
             endpoints,
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_CORRECT_TIMEOUT", "5").parse().unwrap_or(5.0)),
-            terms: terms.to_string(),
+            terms: format!("{terms}{}", mishearings(&keys_file().with_file_name("mishearings.txt"))),
             meter: None,
             skip_file: Some(state_dir().join("correct-skip.txt")),
         })
@@ -211,6 +214,18 @@ impl Corrector {
         }
         Ok(out)
     }
+}
+
+/// The prompt suffix for a `heard -> meant` list; empty when there is none.
+fn mishearings(path: &std::path::Path) -> String {
+    let pairs: Vec<String> = std::fs::read_to_string(path).unwrap_or_default().lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| l.contains("->"))
+        .collect();
+    if pairs.is_empty() {
+        return String::new();
+    }
+    format!("\n\nKnown mishearings from past dictations (recognizer output -> intended): {}.", pairs.join("; "))
 }
 
 fn now() -> f64 {
@@ -387,6 +402,16 @@ mod tests {
         let paths: Vec<String> = hits.lock().unwrap().iter().map(|l| l.split(' ').nth(1).unwrap_or("").to_string()).collect();
         assert_eq!(paths, ["/v1/main", "/v1/fallback", "/v1/fallback"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mishearings_list_skips_comments() {
+        let path = std::env::temp_dir().join(format!("dictate-mishear-{}.txt", std::process::id()));
+        std::fs::write(&path, "# heard -> meant\nDeepSeq -> DeepSeek  # whisper\n\n11 labs -> ElevenLabs\n").unwrap();
+        assert_eq!(mishearings(&path),
+            "\n\nKnown mishearings from past dictations (recognizer output -> intended): DeepSeq -> DeepSeek; 11 labs -> ElevenLabs.");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(mishearings(&path), "");
     }
 
     #[test]
