@@ -21,10 +21,9 @@ anyhow = "1"
 thiserror = "1"
 serde_json = "1"
 # Streaming preview engine (Nemotron). Pinned: the bindings are pre-1.0.
-# 6c24521 is the local-only `phrase-boost` branch (glossary phrase boosting,
-# ParakeetStreamOptions::vocabulary_boost) in ~/projects/transcribe.cpp.
-# Push it to a reachable remote and point `git` there before packaging.
-transcribe-cpp = { git = "file:///home/darth/projects/transcribe.cpp", rev = "6c24521cb008be10adee292107004eea96a83c95", default-features = false, features = ["vulkan"] }
+# 6c24521 is the `phrase-boost` branch of our fork (glossary phrase boosting,
+# ParakeetStreamOptions::vocabulary_boost), not yet upstream.
+transcribe-cpp = { git = "https://github.com/darthdeus/transcribe.cpp", rev = "6c24521cb008be10adee292107004eea96a83c95", default-features = false, features = ["vulkan"] }
 ureq = { version = "2", features = ["json"] }
 # Pure-Rust X11 client: clipboard ownership and window class without
 # spawning copyq/xclip/xdotool on the paste path.
