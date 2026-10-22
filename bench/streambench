@@ -1,0 +1,272 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i python3 -p "python3.withPackages (ps: [ ps.requests ps.websockets ])" vulkan-loader openblas
+"""streambench — how live previews behave while you speak, replayed from clips.
+
+  streambench [SESSION] [-e engines] [--clips 01,02]
+
+Replays each clip of a dictbench session as if spoken live and records what the
+preview would show over time, then scores the timeline:
+
+  rewrites/100w  words already on screen that later changed, per 100 final words
+  settle med/p90 seconds from a word being spoken to it appearing in its final form
+  tail           seconds after the audio ends until the preview stops changing
+  WER            the last preview against the reference sentence
+
+Engines:
+  whisper-preview  today's dictate preview: whole-recording snapshots sent to
+                   whisper-server back to back (+DICTATE_BENCH_OVERHEAD seconds of
+                   copy/convert/style work per request, default 0.2, measured)
+  nemotron-R       Nemotron Speech Streaming via transcribe.cpp, right context R
+                   (0=80 ms, 1=160 ms, 6=560 ms, 13=1120 ms lookahead)
+  deepgram         Deepgram nova-3 streaming with interim results (sent at real
+                   time pace, so it takes as long as the audio)
+
+Word timings come from Nemotron's offline word timestamps for the clip. Local
+engines are simulated on a virtual clock: a result is "shown" when its audio
+would have arrived plus the measured compute time, so runs are deterministic
+apart from compute jitter.
+"""
+import argparse, asyncio, difflib, importlib.machinery, importlib.util, json, os, statistics, sys, time, wave
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TCPP = Path(os.environ.get("TRANSCRIBE_CPP", Path.home() / "projects/transcribe.cpp"))
+NEMOTRON = Path(os.environ.get("NEMOTRON_MODEL", Path.home() / ".local/share/transcribe/nemotron-speech-streaming-en-0.6b-Q8_0.gguf"))
+os.environ.setdefault("TRANSCRIBE_LIBRARY", str(TCPP / "build/src/libtranscribe.so"))
+sys.path.insert(0, str(TCPP / "bindings/python/src"))
+
+# Reuse dictbench's config, keys, scoring and providers.
+_loader = importlib.machinery.SourceFileLoader("dictbench", str(HERE / "dictbench"))
+_spec = importlib.util.spec_from_loader("dictbench", _loader)
+db = importlib.util.module_from_spec(_spec)
+_loader.exec_module(db)
+
+OVERHEAD = float(os.environ.get("DICTATE_BENCH_OVERHEAD", "0.2"))
+RATE = 16000
+
+
+def load_pcm(wav):
+    with wave.open(str(wav)) as w:
+        raw = w.readframes(w.getnframes())
+    import array
+    a = array.array("h")
+    a.frombytes(raw)
+    return a
+
+
+def to_float(a):
+    import array
+    return array.array("f", (s / 32768.0 for s in a))
+
+# ------------------------------------------------------------------ engines
+# Each returns a timeline: [(seconds since speech start, displayed text)], in order.
+
+
+def whisper_preview(pcm, wav, _):
+    import requests, io
+    dur = len(pcm) / RATE
+    server = os.environ.get("DICTATE_SERVER", "http://127.0.0.1:8127")
+    timeline, t = [], 0.3
+    while True:
+        cut = min(int(t * RATE), len(pcm))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+            w.writeframes(pcm[:cut].tobytes())
+        t0 = time.perf_counter()
+        r = requests.post(f"{server}/inference", timeout=60, files={"file": ("a.wav", buf.getvalue())},
+                          data={"response_format": "json", "language": db.LANG, "prompt": db.PROMPT})
+        shown = t + time.perf_counter() - t0 + OVERHEAD
+        text = " ".join(r.json().get("text", "").split())
+        if text:
+            timeline.append((shown, text))
+        if cut >= len(pcm):
+            break
+        t = max(shown + 0.005, 0.3)
+        if t > dur:
+            t = dur  # one last request with the whole clip, like the final transcription
+    return timeline
+
+
+_MODEL = None
+
+
+def nemotron(right):
+    def run(pcm, wav, _):
+        import transcribe_cpp as tc
+        global _MODEL
+        if _MODEL is None:
+            _MODEL = tc.Model(str(NEMOTRON))
+            with _MODEL.session() as s:  # warm up: Vulkan pipelines compile on first use
+                s.run(to_float(pcm[:RATE * 2]))
+        f = to_float(pcm)
+        chunk = int(RATE * float(os.environ.get("STREAM_CHUNK_MS", "160")) / 1000)
+        timeline, busy_until = [], 0.0
+        with _MODEL.session() as s:
+            with s.stream(family=tc.ParakeetStreamOptions(att_context_right=right)) as st:
+                for i in range(0, len(f), chunk):
+                    arrived = min(i + chunk, len(f)) / RATE
+                    t0 = time.perf_counter()
+                    st.feed(f[i:i + chunk])
+                    busy_until = max(arrived, busy_until) + time.perf_counter() - t0
+                    timeline.append((busy_until, st.text().display.strip()))
+                t0 = time.perf_counter()
+                st.finalize()
+                timeline.append((busy_until + time.perf_counter() - t0, st.text().display.strip()))
+        return [(t, x) for t, x in timeline if x]
+    return run
+
+
+def deepgram(pcm, wav, _):
+    async def go():
+        import websockets
+        url = "wss://api.deepgram.com/v1/listen?" + db.deepgram_params(
+            encoding="linear16", sample_rate=str(RATE), channels="1", interim_results="true")
+        finals, interim, timeline = [], "", []
+        raw = pcm.tobytes()
+        step = RATE * 2 // 10
+        async with websockets.connect(url, additional_headers={
+                "Authorization": f"Token {db.KEYS['DEEPGRAM_API_KEY']}"}) as ws:
+            start = time.perf_counter()
+
+            async def send():
+                for i in range(0, len(raw), step):
+                    await ws.send(raw[i:i + step])
+                    # pace by the clock, not by sleep sums, so audio time stays honest
+                    await asyncio.sleep(max(0, (i + step) / (RATE * 2) - (time.perf_counter() - start)))
+                await ws.send(json.dumps({"type": "CloseStream"}))
+            sender = asyncio.create_task(send())
+            async for msg in ws:
+                m = json.loads(msg)
+                if m.get("type") != "Results":
+                    continue
+                text = m["channel"]["alternatives"][0]["transcript"]
+                if m.get("is_final"):
+                    if text:
+                        finals.append(text)
+                    interim = ""
+                else:
+                    interim = text
+                shown = " ".join(finals + ([interim] if interim else []))
+                if shown and (not timeline or timeline[-1][1] != shown):
+                    timeline.append((time.perf_counter() - start, shown))
+            await sender
+        return timeline
+    return asyncio.run(go())
+
+
+def engines(names):
+    table = {"whisper-preview": whisper_preview, "deepgram": deepgram}
+    out = {}
+    for n in names:
+        if n in table:
+            out[n] = table[n]
+        elif n.startswith("nemotron-") and n.split("-", 1)[1] in ("0", "1", "6", "13"):
+            out[n] = nemotron(int(n.split("-", 1)[1]))
+        else:
+            sys.exit(f"unknown engine {n}")
+    return out
+
+# ------------------------------------------------------------------ timing reference
+
+
+def word_times(pcm):
+    """(normalized word, end seconds) for the clip, from Nemotron offline timestamps."""
+    import transcribe_cpp as tc
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = tc.Model(str(NEMOTRON))
+    with _MODEL.session() as s:
+        res = s.run(to_float(pcm), timestamps="word")
+    out = []
+    for w in res.words:
+        for norm in db.words(w.text):
+            out.append((norm, w.t1_ms / 1000))
+    return out
+
+# ------------------------------------------------------------------ scoring
+
+
+def score(timeline, ref, times, dur):
+    shown = [db.words(t) for _, t in timeline]
+    final = shown[-1] if shown else []
+    rewrites = 0
+    for prev, cur in zip(shown, shown[1:]):
+        # A half-spoken word growing ("re" -> "rebuild") is not a rewrite.
+        rewrites += sum(1 for i, w in enumerate(prev)
+                        if i >= len(cur) or (cur[i] != w and not (i == len(prev) - 1 and cur[i].startswith(w))))
+    # When did each final word settle (appear at its index and never change)?
+    settle = [None] * len(final)
+    for i in range(len(final)):
+        for k in range(len(shown) - 1, -1, -1):
+            if len(shown[k]) > i and shown[k][i] == final[i]:
+                settle[i] = timeline[k][0]
+            else:
+                break
+    # Map final words onto spoken times by aligning with the timestamped words.
+    spoken = [w for w, _ in times]
+    lags = []
+    sm = difflib.SequenceMatcher(a=final, b=spoken, autojunk=False)
+    for a, b, n in sm.get_matching_blocks():
+        for j in range(n):
+            if settle[a + j] is not None:
+                lags.append(settle[a + j] - times[b + j][1])
+    rw = db.words(ref)
+    lags.sort()
+    return {"rewrites": 100 * rewrites / max(len(final), 1),
+            "settle_med": statistics.median(lags) if lags else None,
+            "settle_p90": lags[int(0.9 * (len(lags) - 1))] if lags else None,
+            "tail": (timeline[-1][0] - dur) if timeline else None,
+            "edits": db.edit_distance(rw, final), "ref_words": len(rw),
+            "first": timeline[0][0] if timeline else None, "updates": len(timeline),
+            "final": timeline[-1][1] if timeline else ""}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session", nargs="?")
+    ap.add_argument("-e", "--engines", default="whisper-preview,nemotron-1,nemotron-6,deepgram")
+    ap.add_argument("--clips", help="comma-separated clip ids, e.g. 01,05")
+    a = ap.parse_args()
+    session = (Path(a.session) if a.session and "/" in a.session else db.STATE / a.session) if a.session \
+        else max((p for p in db.STATE.iterdir() if p.is_dir()), key=lambda p: p.name)
+    clips = sorted(session.glob("*.wav"))
+    if a.clips:
+        clips = [c for c in clips if c.stem in a.clips.split(",")]
+    eng = engines(a.engines.split(","))
+    if "deepgram" in eng and not db.KEYS.get("DEEPGRAM_API_KEY"):
+        del eng["deepgram"]
+    print(f"Session {session.name}: {len(clips)} clips; engines: {', '.join(eng)}")
+
+    results = {n: [] for n in eng}
+    timelines = {}
+    for clip in clips:
+        pcm = load_pcm(clip)
+        dur = len(pcm) / RATE
+        ref = clip.with_suffix(".txt").read_text().strip()
+        times = word_times(pcm)
+        print(f"  {clip.stem} ({dur:.1f}s): ", end="", flush=True)
+        for name, fn in eng.items():
+            tl = fn(pcm, clip, ref)
+            timelines[f"{clip.stem}/{name}"] = tl
+            results[name].append(score(tl, ref, times, dur))
+            print(".", end="", flush=True)
+        print()
+
+    def f(v, unit="s"):
+        return "-" if v is None else f"{v:.2f} {unit}"
+    lines = ["| engine | rewrites/100w | settle median | settle p90 | tail | first text | WER |",
+             "|---|---|---|---|---|---|---|"]
+    for name, rs in results.items():
+        med = lambda k: statistics.median([r[k] for r in rs if r[k] is not None]) if rs else None
+        wer = sum(r["edits"] for r in rs) / max(sum(r["ref_words"] for r in rs), 1)
+        lines.append(f"| {name} | {statistics.mean(r['rewrites'] for r in rs):.1f} | {f(med('settle_med'))} | "
+                     f"{f(med('settle_p90'))} | {f(med('tail'))} | {f(med('first'))} | {wer:.1%} |")
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    out = session / f"stream-{stamp}.json"
+    out.write_text(json.dumps({"summary": lines, "results": results, "timelines": timelines}, indent=1))
+    print("\n" + "\n".join(lines) + f"\n\nTimelines: {out}")
+
+
+if __name__ == "__main__":
+    main()

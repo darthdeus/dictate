@@ -13,6 +13,9 @@ config.local.toml
 history/
 recordings/
 .cache/
+# Bench sentences hold personal vocabulary; sentences.example.txt is the template.
+bench/sentences*.txt
+!bench/sentences.example.txt
 
 # Python and editor output.
 __pycache__/

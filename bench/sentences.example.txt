@@ -1,0 +1,11 @@
+# One reference sentence per line; '#' lines are skipped. Read each one
+# naturally, the way you would dictate it. Edit freely — `record` stores a copy
+# of the text next to the audio, so later edits don't invalidate old takes.
+Okay, can you look at the dictate tool and check why the preview is so slow?
+Open CLAUDE.md and add a note that agents should never run nixos-rebuild themselves.
+Can you open the README and check whether the install steps still work on NixOS?
+Run cargo test with the release flag and tell me which tests fail.
+I think the bug is in the config parser, it reads the timeout as seconds instead of milliseconds.
+Okay, so let's add a fallback endpoint, and if the first request fails, we retry on the second one.
+Please rename the function to apply fixes and update every call site.
+The overlay should hide when I click it, and it should never steal focus from the editor.

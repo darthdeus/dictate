@@ -1,0 +1,113 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i python3 -p "python3.withPackages (ps: [ ps.requests ps.websockets ])" vulkan-loader openblas
+"""livedemo — feel streaming-first dictation in a terminal.
+
+  livedemo [--right 1] [--no-llm]
+
+Enter starts, Enter stops, Ctrl-C quits. While you speak, Nemotron streams the
+preview (committed text bright, tentative suffix dim). On stop, the whole clip
+goes through whisper-server with a sentence-style prompt and then the Groq LLM
+correction pass, and the corrected text replaces the preview. Timings for each
+stage are printed. Nothing is typed or pasted anywhere.
+"""
+import argparse, array, io, os, subprocess, sys, threading, time, wave
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import importlib.machinery, importlib.util  # noqa: E402
+_loader = importlib.machinery.SourceFileLoader("streambench", str(Path(__file__).resolve().parent / "streambench"))
+_spec = importlib.util.spec_from_loader("streambench", _loader)
+sb = importlib.util.module_from_spec(_spec)
+_loader.exec_module(sb)
+db = sb.db
+import requests  # noqa: E402
+import transcribe_cpp as tc  # noqa: E402
+
+DIM, RESET, BOLD = "\x1b[2m", "\x1b[0m", "\x1b[1m"
+SENTENCE_PROMPT = os.environ.get("DICTATE_SENTENCE_PROMPT",
+    "Okay, so in Claude Code I want a sub-agent to edit CLAUDE.md, update nixpkgs on NixOS, "
+    f"and check the ComfyUI workflow. {db.PROMPT}.")
+
+
+def screen(*lines):
+    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def whisper_final(pcm16):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(pcm16.tobytes())
+    server = os.environ.get("DICTATE_SERVER", "http://127.0.0.1:8127")
+    r = requests.post(f"{server}/inference", timeout=60, files={"file": ("a.wav", buf.getvalue())},
+                      data={"response_format": "json", "language": db.LANG, "prompt": SENTENCE_PROMPT,
+                            "temperature": "0.0"})
+    return " ".join(r.json()["text"].split())
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--right", type=int, default=1, choices=[0, 1, 6, 13])
+    ap.add_argument("--no-llm", action="store_true")
+    a = ap.parse_args()
+    mic = db.CFG.get("DICTATE_MIC") or "@DEFAULT_SOURCE@"
+    channels, chan = int(db.CFG.get("DICTATE_CHANNELS", 1)), int(db.CFG.get("DICTATE_CHAN", 0))
+    chunk_bytes = int(16000 * 0.16) * channels * 2
+
+    screen("Loading Nemotron (first load compiles GPU shaders)...")
+    model = tc.Model(str(sb.NEMOTRON))
+    with model.session() as s:
+        s.run(array.array("f", [0.0] * 32000))
+
+    screen(f"{BOLD}Enter{RESET} to start talking, Ctrl-C to quit.")
+    while True:
+        input()
+        stop = threading.Event()
+        threading.Thread(target=lambda: (input(), stop.set()), daemon=True).start()
+        rec = subprocess.Popen(["pw-record", "--target", mic, "--rate", "16000", "--channels", str(channels),
+                                "--format", "s16", "--container", "raw", "-"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        audio = array.array("h")
+        t_start = time.perf_counter()
+        with model.session() as s, s.stream(family=tc.ParakeetStreamOptions(att_context_right=a.right)) as st:
+            shown = None
+            while not stop.is_set():
+                raw = rec.stdout.read(chunk_bytes)
+                if not raw:
+                    break
+                frames = array.array("h")
+                frames.frombytes(raw[:len(raw) - len(raw) % (2 * channels)])
+                mono = frames[chan::channels]
+                audio.extend(mono)
+                st.feed(array.array("f", (x / 32768.0 for x in mono)))
+                t = st.text()
+                view = (t.committed, t.tentative)
+                if view != shown:
+                    shown = view
+                    screen(f"{DIM}recording {time.perf_counter() - t_start:4.1f}s — Enter to stop{RESET}", "",
+                           f"{t.committed}{DIM}{t.tentative}{RESET}")
+            rec.terminate()
+            t_stop = time.perf_counter()
+            st.finalize()
+            preview = st.text().display.strip()
+        t_prev = time.perf_counter()
+        final = whisper_final(audio)
+        t_whisper = time.perf_counter()
+        corrected = final if a.no_llm else db.llm_post("qwen3.8-27b", final)
+        t_llm = time.perf_counter()
+        screen(f"{DIM}{len(audio) / 16000:.1f}s of audio{RESET}", "",
+               f"{BOLD}live (Nemotron){RESET}   {preview}", "",
+               f"{BOLD}whisper{RESET}           {final}", "",
+               f"{BOLD}+ Qwen (pasted){RESET}   {corrected}", "",
+               f"{DIM}after you stopped: preview final {1000 * (t_prev - t_stop):.0f} ms, "
+               f"whisper +{1000 * (t_whisper - t_prev):.0f} ms, Qwen +{1000 * (t_llm - t_whisper):.0f} ms "
+               f"= {1000 * (t_llm - t_stop):.0f} ms total{RESET}", "",
+               f"{BOLD}Enter{RESET} for another, Ctrl-C to quit.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
