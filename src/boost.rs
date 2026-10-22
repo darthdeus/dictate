@@ -13,6 +13,11 @@
 //!   the filtered `DICTATE_TERMS`.
 //! - `DICTATE_PREVIEW_STOP`: extra comma-separated terms to leave out of
 //!   the filtered `DICTATE_TERMS` (case-insensitive).
+//!
+//! Boosting cannot produce a spelling the model has no tokens for (Locika,
+//! mlef, MÁG): `preview-fixes.txt` next to the keys file maps what the
+//! preview hears to the term (`Lotsika -> Locika`), whole words, ignoring
+//! case, on the shown text only.
 
 use crate::config::Config;
 
@@ -105,6 +110,52 @@ pub fn preview_boost(cfg: &Config) -> Option<(Vec<String>, f32)> {
     (!terms.is_empty()).then_some((terms, weight))
 }
 
+/// `heard -> meant` replacements for the preview text (see module docs).
+#[derive(Default)]
+pub struct PreviewFixes(Vec<(Vec<String>, String)>);
+
+impl PreviewFixes {
+    pub fn load() -> Self {
+        Self::parse(&std::fs::read_to_string(crate::correct::keys_file().with_file_name("preview-fixes.txt")).unwrap_or_default())
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self(text.lines()
+            .map(|l| l.split('#').next().unwrap_or(""))
+            .filter_map(|l| l.split_once("->"))
+            .map(|(heard, meant)| (heard.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>(), meant.trim().to_string()))
+            .filter(|(heard, meant)| !heard.is_empty() && !meant.is_empty())
+            .collect())
+    }
+
+    /// Replaces each heard phrase (punctuation after a word is kept) and
+    /// keeps a leading space, which separates tentative from committed text.
+    pub fn apply(&self, text: &str) -> String {
+        if self.0.is_empty() {
+            return text.to_string();
+        }
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        let bare = |t: &str| t.trim_end_matches(|c: char| ",.?!:;".contains(c)).to_lowercase();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0;
+        'next: while i < toks.len() {
+            for (heard, meant) in &self.0 {
+                let n = heard.len();
+                if i + n <= toks.len() && (0..n).all(|k| bare(toks[i + k]) == heard[k]) {
+                    let last = toks[i + n - 1];
+                    out.push(format!("{meant}{}", &last[last.trim_end_matches(|c: char| ",.?!:;".contains(c)).len()..]));
+                    i += n;
+                    continue 'next;
+                }
+            }
+            out.push(toks[i].to_string());
+            i += 1;
+        }
+        let lead = if text.starts_with(char::is_whitespace) { " " } else { "" };
+        format!("{lead}{}", out.join(" "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +190,13 @@ mod tests {
         }
         assert!(preview_boost(&cfg(&[("DICTATE_TERMS", "AI, master")])).is_none());
         assert!(preview_boost(&cfg(&[])).is_none());
+    }
+
+    #[test]
+    fn preview_fixes_replace_whole_words() {
+        let f = PreviewFixes::parse("# comment\nLotsika -> Locika\nDeep Seek -> DeepSeek\nM one -> M1\n");
+        assert_eq!(f.apply("On Lotsika, ask Deep Seek about M one."), "On Locika, ask DeepSeek about M1.");
+        assert_eq!(f.apply(" deep seeker stays"), " deep seeker stays");
+        assert_eq!(PreviewFixes::default().apply(" x  y"), " x  y");
     }
 }

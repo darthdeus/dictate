@@ -258,6 +258,7 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     let mut stream = session.stream(&run, &opts)?;
     let mut audio: Vec<i16> = Vec::with_capacity(RATE as usize * 60);
     let mut early = EarlyWorker::new(ctx);
+    let fixes = crate::boost::PreviewFixes::load();
     let mut buf = vec![0u8; chunk_bytes];
     let mut eof = false;
     // Stop latency breakdown: when the stop flag was first seen, and how
@@ -305,7 +306,7 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
         if update.committed_changed || update.tentative_changed || early_changed {
             let t = stream.text();
             let (committed, tentative) = early.preview(&t.committed, &t.tentative);
-            overlay.show(&committed, &tentative);
+            overlay.show(&fixes.apply(&committed), &fixes.apply(&tentative));
         }
     }
     let eof_at = Instant::now();
