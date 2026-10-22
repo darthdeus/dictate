@@ -136,6 +136,8 @@ daily limit answers 429) it asks the same model on OpenRouter
 (`OPENROUTER_API_KEY` in keys.env; providers `DICTATE_CORRECT_FALLBACK_PROVIDERS`,
 default ModelRun, DeepInfra, Cerebras; `DICTATE_CORRECT_FALLBACK=0` turns it
 off). Same fixes, ~350 ms instead of ~200 ms, about $0.0001 a correction.
+After a 429, Groq is skipped for its `retry-after` (state file
+`correct-skip.txt`), so the fallback is asked directly until then.
 
 The GTK overlay (`bin/dictate-overlay`, `lib/dictate-overlay/overlay.py`) is
 built on first use. If Nix or the `<nixpkgs>` channel is unavailable, it

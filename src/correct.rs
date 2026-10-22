@@ -17,6 +17,9 @@
 //! ModelRun and DeepInfra were cheapest ($0.20/$0.15 per 1M in, ~$0.0001 a
 //! correction) and fastest (~345 ms median vs Groq ~200 ms), Cerebras next. `DICTATE_CORRECT_FALLBACK=0`
 //! turns it off; without `OPENROUTER_API_KEY` there is no fallback.
+//! A 429 parks that endpoint for its `retry-after` (Groq: until the daily
+//! tokens recover) in `correct-skip.txt`, shared by `stop` and the daemon,
+//! so later corrections go straight to the fallback instead of re-asking.
 
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
@@ -58,6 +61,8 @@ pub struct Corrector {
     pub timeout: Duration,
     pub terms: String,
     pub meter: Option<crate::usage::Meter>,
+    /// `<api> <unix secs>` lines: endpoints rate-limited until then.
+    pub skip_file: Option<std::path::PathBuf>,
 }
 
 impl Corrector {
@@ -98,6 +103,7 @@ impl Corrector {
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_CORRECT_TIMEOUT", "5").parse().unwrap_or(5.0)),
             terms: terms.to_string(),
             meter: None,
+            skip_file: Some(state_dir().join("correct-skip.txt")),
         })
     }
 
@@ -105,7 +111,12 @@ impl Corrector {
     /// the change guard does not (the same model would answer the same).
     pub fn correct(&self, text: &str) -> Result<String> {
         let mut err = None;
-        for ep in &self.endpoints {
+        let skipped = self.skipped();
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            // The last endpoint is always asked: nothing else could answer.
+            if i + 1 < self.endpoints.len() && skipped.contains(&ep.api) {
+                continue;
+            }
             match self.ask(ep, text) {
                 Ok(resp) => return self.finish(text, resp),
                 Err(e) => err = Some(e.context(format!("{}", ep.api))),
@@ -148,11 +159,43 @@ impl Corrector {
             .send_json(body)
             .map_err(|e| match e {
                 // The body says why (bad model, quota); the URL and key do not belong in logs.
-                ureq::Error::Status(code, r) => anyhow::anyhow!("HTTP {code}: {}",
-                    r.into_string().unwrap_or_default().chars().take(200).collect::<String>()),
+                ureq::Error::Status(code, r) => {
+                    if code == 429 {
+                        let secs = r.header("retry-after").and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(600.0);
+                        self.skip(&ep.api, secs.clamp(1.0, 86400.0));
+                    }
+                    anyhow::anyhow!("HTTP {code}: {}",
+                        r.into_string().unwrap_or_default().chars().take(200).collect::<String>())
+                }
                 ureq::Error::Transport(t) => anyhow::anyhow!("{}", t.kind()),
             })?
             .into_json()?)
+    }
+
+    fn skip_entries(&self) -> Vec<(String, f64)> {
+        let Some(path) = &self.skip_file else { return Vec::new() };
+        std::fs::read_to_string(path).unwrap_or_default().lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter_map(|(api, until)| Some((api.to_string(), until.trim().parse().ok()?)))
+            .collect()
+    }
+
+    /// APIs still inside their rate-limit window.
+    fn skipped(&self) -> Vec<String> {
+        let now = now();
+        self.skip_entries().into_iter().filter(|(_, until)| *until > now).map(|(api, _)| api).collect()
+    }
+
+    fn skip(&self, api: &str, secs: f64) {
+        let Some(path) = &self.skip_file else { return };
+        let now = now();
+        let mut lines: Vec<String> = self.skip_entries().into_iter()
+            .filter(|(a, until)| a != api && *until > now)
+            .map(|(a, until)| format!("{a} {until:.0}"))
+            .collect();
+        lines.push(format!("{api} {:.0}", now + secs));
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
+        let _ = std::fs::write(path, lines.join("\n") + "\n");
     }
 
     fn finish(&self, text: &str, resp: serde_json::Value) -> Result<String> {
@@ -168,6 +211,19 @@ impl Corrector {
         }
         Ok(out)
     }
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn state_dir() -> std::path::PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state"))
+        .join("dictate")
 }
 
 /// An API key by name, from the environment, else the private keys file.
@@ -262,22 +318,75 @@ mod tests {
         assert_eq!(edit_distance(&w(""), &w("a b")), 2);
     }
 
+    /// Reads one whole HTTP request (headers, then Content-Length bytes):
+    /// answering earlier and closing would reset the client mid-send.
+    fn read_request(conn: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let text = String::from_utf8_lossy(&data).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let len = text.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                if data.len() >= end + 4 + len {
+                    return text;
+                }
+            }
+            match conn.read(&mut buf) {
+                Ok(0) | Err(_) => return String::from_utf8_lossy(&data).to_string(),
+                Ok(n) => data.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
     #[test]
     fn failed_endpoint_falls_back_to_next() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/chat/completions", server.local_addr().unwrap());
         std::thread::spawn(move || {
             let (mut conn, _) = server.accept().unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = conn.read(&mut buf);
+            read_request(&mut conn);
             let body = r#"{"choices":[{"message":{"content":"{\"fixes\":[{\"from\":\"deep sea\",\"to\":\"DeepSeek\"}]}"}}]}"#;
             let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
         });
         let ep = |api: &str, url: &str| Endpoint { api: api.into(), url: url.into(), model: "m".into(), key: "k".into(), extra: serde_json::json!({}) };
         let c = Corrector { endpoints: vec![ep("down", "http://127.0.0.1:1/x"), ep("up", &url)],
-            timeout: Duration::from_secs(5), terms: String::new(), meter: None };
+            timeout: Duration::from_secs(5), terms: String::new(), meter: None, skip_file: None };
         assert_eq!(c.correct("please try deep sea on the bench later today").unwrap(), "please try DeepSeek on the bench later today");
+    }
+
+    #[test]
+    fn rate_limited_endpoint_is_skipped_until_retry_after() {
+        use std::io::Write;
+        // One server: answers 429 to the first request, a fix to the rest.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for (n, conn) in server.incoming().enumerate() {
+                let mut conn = conn.unwrap();
+                let req = read_request(&mut conn);
+                seen.lock().unwrap().push(req.lines().next().unwrap_or("").to_string());
+                if n == 0 {
+                    let _ = write!(conn, "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3600\r\nContent-Length: 0\r\n\r\n");
+                } else {
+                    let body = r#"{"choices":[{"message":{"content":"{\"fixes\":[]}"}}]}"#;
+                    let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("dictate-skip-{}", std::process::id()));
+        let ep = |api: &str, path: &str| Endpoint { api: api.into(), url: format!("{url}/{path}"), model: "m".into(), key: "k".into(), extra: serde_json::json!({}) };
+        let c = Corrector { endpoints: vec![ep("groq", "main"), ep("openrouter", "fallback")],
+            timeout: Duration::from_secs(5), terms: String::new(), meter: None, skip_file: Some(dir.join("skip.txt")) };
+        let text = "one two three four five six seven";
+        assert_eq!(c.correct(text).unwrap(), text);
+        assert_eq!(c.correct(text).unwrap(), text);
+        let paths: Vec<String> = hits.lock().unwrap().iter().map(|l| l.split(' ').nth(1).unwrap_or("").to_string()).collect();
+        assert_eq!(paths, ["/v1/main", "/v1/fallback", "/v1/fallback"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
