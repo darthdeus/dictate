@@ -260,7 +260,14 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     let mut early = EarlyWorker::new(ctx);
     let mut buf = vec![0u8; chunk_bytes];
     let mut eof = false;
+    // Stop latency breakdown: when the stop flag was first seen, and how
+    // much buffered audio was still fed to the model after it.
+    let mut stop_seen: Option<Instant> = None;
+    let mut fed_after_stop = 0usize;
     while !eof && audio.len() < max_samples {
+        if stop_seen.is_none() && stop.load(Ordering::SeqCst) {
+            stop_seen = Some(Instant::now());
+        }
         let mut filled = 0;
         while filled < buf.len() {
             match out.read(&mut buf[filled..]) {
@@ -285,6 +292,12 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
             let _ = f.write_all(&bytes);
         }
         audio.extend_from_slice(&mono);
+        // After stop the preview is gone and the text comes from the final
+        // pass: buffered audio only needs keeping, not recognizing.
+        if stop_seen.is_some() {
+            fed_after_stop += mono.len();
+            continue;
+        }
         let t = stream.text();
         let early_changed = early.heard(&audio, &t.committed, &t.tentative);
         let pcm: Vec<f32> = mono.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -295,15 +308,20 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
             overlay.show(&committed, &tentative);
         }
     }
+    let eof_at = Instant::now();
     let _ = child.kill();
     let _ = child.wait();
-    let t = Instant::now();
-    stream.finalize()?;
-    append_log(&ctx.log, &format!("{} daemon: {:.1}s captured, finalize {:.0} ms",
-        crate::history::local_iso_now(), audio.len() as f64 / RATE as f64, t.elapsed().as_secs_f64() * 1000.0));
+    // No `stream.finalize()`: its text would be unused, and it took up to
+    // 640 ms of the release (2026-10-22). Dropping the stream resets it.
+    drop(stream);
     drop(level);
     let _ = std::fs::remove_file(&level_path);
+    let t = Instant::now();
     let early = early.finish(&ctx.log, &audio);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    append_log(&ctx.log, &format!("{} daemon: {:.1}s captured; stop: eof +{:.0} ms ({:.0} ms audio kept after stop), early finish {:.0} ms",
+        crate::history::local_iso_now(), audio.len() as f64 / RATE as f64,
+        stop_seen.map(|s| ms(eof_at - s)).unwrap_or(-1.0), fed_after_stop as f64 * 1000.0 / RATE as f64, ms(t.elapsed())));
     Ok((audio, early))
 }
 
