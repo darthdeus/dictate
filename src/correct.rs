@@ -10,6 +10,13 @@
 //! output no longer grows with the text (150 vs 424 ms on 37 s). A fix can
 //! only swap a phrase that is in the transcript, so a dictated instruction
 //! cannot turn into a rewritten message.
+//!
+//! When the main endpoint fails (Groq's free tier runs out at ~200k tokens a
+//! day and answers 429), the same model is asked on OpenRouter instead.
+//! 2026-10-22 bench, reasoning off: every provider gave identical fixes;
+//! ModelRun and DeepInfra were cheapest ($0.20/$0.15 per 1M in, ~$0.0001 a
+//! correction) and fastest (~345 ms median vs Groq ~200 ms), Cerebras next. `DICTATE_CORRECT_FALLBACK=0`
+//! turns it off; without `OPENROUTER_API_KEY` there is no fallback.
 
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
@@ -19,6 +26,8 @@ use crate::config::Config;
 pub const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 pub const DEFAULT_MODEL: &str = "qwen/qwen3.8-27b";
 pub const MAX_CHANGE: f64 = 0.3;
+pub const FALLBACK_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+pub const FALLBACK_PROVIDERS: &str = "modelrun,deepinfra,cerebras";
 
 const SYSTEM: &str = "You correct speech-recognition transcripts of dictation.
 The speaker is a programmer dictating messages and instructions for AI coding agents.
@@ -34,10 +43,18 @@ Output {\"fixes\": []} when nothing needs fixing.
 
 Glossary: ";
 
-pub struct Corrector {
+/// One OpenAI-compatible chat endpoint; `extra` is merged into the body.
+pub struct Endpoint {
+    pub api: String,
     pub url: String,
     pub model: String,
     pub key: String,
+    pub extra: serde_json::Value,
+}
+
+pub struct Corrector {
+    /// Tried in order until one answers.
+    pub endpoints: Vec<Endpoint>,
     pub timeout: Duration,
     pub terms: String,
     pub meter: Option<crate::usage::Meter>,
@@ -47,44 +64,87 @@ impl Corrector {
     /// The key is looked up by name (`DICTATE_CORRECT_KEY`, default
     /// `GROQ_API_KEY`) in the environment, then in the private keys file, so
     /// it never sits in the shared config.
+    /// An endpoint whose key is missing is left out; it is an error only when
+    /// none is left.
     pub fn from_config(cfg: &Config, terms: &str) -> Result<Self> {
-        let key_name = cfg.get_or("DICTATE_CORRECT_KEY", "GROQ_API_KEY");
-        let key = key(&key_name)?;
+        let model = cfg.get_or("DICTATE_CORRECT_MODEL", DEFAULT_MODEL);
+        let mut endpoints = Vec::new();
+        let main = key(&cfg.get_or("DICTATE_CORRECT_KEY", "GROQ_API_KEY"));
+        if let Ok(key) = &main {
+            let url = cfg.get_or("DICTATE_CORRECT_URL", DEFAULT_URL);
+            let api = if url.contains("groq.com") { "groq" } else { "correct" };
+            endpoints.push(Endpoint { api: api.into(), url, model: model.clone(), key: key.clone(), extra: serde_json::json!({}) });
+        }
+        if cfg.get_or("DICTATE_CORRECT_FALLBACK", "1") == "1" {
+            if let Ok(key) = self::key(&cfg.get_or("DICTATE_CORRECT_FALLBACK_KEY", "OPENROUTER_API_KEY")) {
+                let order: Vec<String> = cfg.get_or("DICTATE_CORRECT_FALLBACK_PROVIDERS", FALLBACK_PROVIDERS)
+                    .split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+                endpoints.push(Endpoint {
+                    api: "openrouter".into(),
+                    url: cfg.get_or("DICTATE_CORRECT_FALLBACK_URL", FALLBACK_URL),
+                    model: cfg.get_or("DICTATE_CORRECT_FALLBACK_MODEL", &model),
+                    key,
+                    // Reasoning off: otherwise ~180 thinking tokens per request.
+                    extra: serde_json::json!({"provider": {"order": order}, "reasoning": {"enabled": false}}),
+                });
+            }
+        }
+        if endpoints.is_empty() {
+            main?;
+            bail!("no correction endpoint");
+        }
         Ok(Self {
-            url: cfg.get_or("DICTATE_CORRECT_URL", DEFAULT_URL),
-            model: cfg.get_or("DICTATE_CORRECT_MODEL", DEFAULT_MODEL),
-            key,
+            endpoints,
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_CORRECT_TIMEOUT", "5").parse().unwrap_or(5.0)),
             terms: terms.to_string(),
             meter: None,
         })
     }
 
+    /// A failed request moves on to the next endpoint; an answer rejected by
+    /// the change guard does not (the same model would answer the same).
     pub fn correct(&self, text: &str) -> Result<String> {
-        let body = serde_json::json!({
-            "model": self.model, "temperature": 0,
+        let mut err = None;
+        for ep in &self.endpoints {
+            match self.ask(ep, text) {
+                Ok(resp) => return self.finish(text, resp),
+                Err(e) => err = Some(e.context(format!("{}", ep.api))),
+            }
+        }
+        Err(err.unwrap_or_else(|| anyhow::anyhow!("no correction endpoint")))
+    }
+
+    fn ask(&self, ep: &Endpoint, text: &str) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({
+            "model": ep.model, "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": format!("{SYSTEM}{}", self.terms)},
                 {"role": "user", "content": format!("<transcript>\n{text}\n</transcript>")}
             ]
         });
+        if let (Some(b), Some(extra)) = (body.as_object_mut(), ep.extra.as_object()) {
+            b.extend(extra.clone());
+        }
         let t = std::time::Instant::now();
-        let resp: Result<serde_json::Value> = self.request(body);
+        let resp: Result<serde_json::Value> = self.request(ep, body);
         if let Some(m) = &self.meter {
             let tokens = |k: &str| resp.as_ref().ok().and_then(|r| r.pointer(&format!("/usage/{k}"))).and_then(|v| v.as_u64()).unwrap_or(0);
             let (input, output) = (tokens("prompt_tokens"), tokens("completion_tokens"));
-            m.record(crate::usage::ApiCall { api: "groq".into(), model: self.model.clone(), input_tokens: input,
+            // OpenRouter reports what the request cost; otherwise Groq prices.
+            let usd = resp.as_ref().ok().and_then(|r| r.pointer("/usage/cost")).and_then(|v| v.as_f64())
+                .unwrap_or((input as f64 * m.groq_in + output as f64 * m.groq_out) / 1e6);
+            m.record(crate::usage::ApiCall { api: ep.api.clone(), model: ep.model.clone(), input_tokens: input,
                 output_tokens: output, ms: t.elapsed().as_secs_f64() * 1000.0, ok: resp.is_ok(),
-                usd: (input as f64 * m.groq_in + output as f64 * m.groq_out) / 1e6, ..Default::default() });
+                usd, ..Default::default() });
         }
-        self.finish(text, resp?)
+        resp
     }
 
-    fn request(&self, body: serde_json::Value) -> Result<serde_json::Value> {
-        Ok(ureq::post(&self.url)
+    fn request(&self, ep: &Endpoint, body: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(ureq::post(&ep.url)
             .timeout(self.timeout)
-            .set("Authorization", &format!("Bearer {}", self.key))
+            .set("Authorization", &format!("Bearer {}", ep.key))
             .send_json(body)
             .map_err(|e| match e {
                 // The body says why (bad model, quota); the URL and key do not belong in logs.
@@ -200,6 +260,24 @@ mod tests {
         let w = |s: &str| words(s);
         assert_eq!(edit_distance(&w("a b c d"), &w("a x c d e")), 2);
         assert_eq!(edit_distance(&w(""), &w("a b")), 2);
+    }
+
+    #[test]
+    fn failed_endpoint_falls_back_to_next() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut conn, _) = server.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = conn.read(&mut buf);
+            let body = r#"{"choices":[{"message":{"content":"{\"fixes\":[{\"from\":\"deep sea\",\"to\":\"DeepSeek\"}]}"}}]}"#;
+            let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        });
+        let ep = |api: &str, url: &str| Endpoint { api: api.into(), url: url.into(), model: "m".into(), key: "k".into(), extra: serde_json::json!({}) };
+        let c = Corrector { endpoints: vec![ep("down", "http://127.0.0.1:1/x"), ep("up", &url)],
+            timeout: Duration::from_secs(5), terms: String::new(), meter: None };
+        assert_eq!(c.correct("please try deep sea on the bench later today").unwrap(), "please try DeepSeek on the bench later today");
     }
 
     #[test]
