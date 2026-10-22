@@ -139,6 +139,11 @@ off). Same fixes, ~350 ms instead of ~200 ms, about $0.0001 a correction.
 After a 429, Groq is skipped for its `retry-after` (state file
 `correct-skip.txt`), so the fallback is asked directly until then.
 
+The correction also formats code for agent chats: file names, paths,
+commands, flags, environment variables and identifiers get backticks
+("claude dot md" -> `CLAUDE.md`, "dash dash release" -> `--release`);
+names like Rust or Locika stay plain. `DICTATE_CORRECT_FORMAT=0` turns it off.
+
 The GTK overlay (`bin/dictate-overlay`, `lib/dictate-overlay/overlay.py`) is
 built on first use. If Nix or the `<nixpkgs>` channel is unavailable, it
 reports the failure once through the desktop notification system when

@@ -49,6 +49,34 @@ Output {\"fixes\": []} when nothing needs fixing.
 
 Glossary: ";
 
+/// Inserted into [`SYSTEM`] unless `DICTATE_CORRECT_FORMAT=0`. Tuned on
+/// 12 hand-written cases (11 right) and 80 real dictations (one false
+/// positive: \"ran Claude or Codex\").
+const FORMAT: &str = "Formatting: the text is pasted into chats with coding agents, which render Markdown. Wrap in
+backticks what would be code when written: file names and paths (CLAUDE.md, src/main.rs), a
+shell command with its arguments as one span (`cargo nextest run`, `git rebase`), flags
+(`--release`), environment variables (`ROCK_WORK_ROOT`) and code identifiers such as function,
+type or config key names (`apply_fixes`, `DICTATE_TERMS`). This is a fix too: wrap such items
+even when they are already spelled correctly. Spell them as in code: \"claude dot md\" ->
+`CLAUDE.md`, \"dash dash release\" -> `--release`, \"src slash main dot rs\" -> `src/main.rs`.
+Example: \"run cargo test with dash dash release and set DICTATE_FINAL\" -> fixes
+[{\"from\": \"cargo test with dash dash release\", \"to\": \"`cargo test` with `--release`\"},
+{\"from\": \"DICTATE_FINAL\", \"to\": \"`DICTATE_FINAL`\"}].
+Do not use backticks for ordinary words or verbs (push, merge, review), for product, model,
+machine or project names (Rust, LuaJIT, NixOS, Locika, Luna, Opus, MÁG; also \"ran Claude or
+Codex\" stays as names, not commands), or for a word only
+because it is in the glossary. If unsure, leave it unformatted.
+";
+
+/// The system prompt, with the formatting rule when `format` is set.
+pub fn system_prompt(format: bool) -> String {
+    if format {
+        SYSTEM.replace("Do not repeat the transcript.", &format!("{FORMAT}Do not repeat the transcript."))
+    } else {
+        SYSTEM.to_string()
+    }
+}
+
 /// One OpenAI-compatible chat endpoint; `extra` is merged into the body.
 pub struct Endpoint {
     pub api: String,
@@ -62,6 +90,8 @@ pub struct Corrector {
     /// Tried in order until one answers.
     pub endpoints: Vec<Endpoint>,
     pub timeout: Duration,
+    /// [`system_prompt`]; the glossary follows it.
+    pub system: String,
     pub terms: String,
     pub meter: Option<crate::usage::Meter>,
     /// `<api> <unix secs>` lines: endpoints rate-limited until then.
@@ -104,6 +134,7 @@ impl Corrector {
         Ok(Self {
             endpoints,
             timeout: Duration::from_secs_f64(cfg.get_or("DICTATE_CORRECT_TIMEOUT", "5").parse().unwrap_or(5.0)),
+            system: system_prompt(cfg.get_or("DICTATE_CORRECT_FORMAT", "1") == "1"),
             terms: format!("{terms}{}", mishearings(&keys_file().with_file_name("mishearings.txt"))),
             meter: None,
             skip_file: Some(state_dir().join("correct-skip.txt")),
@@ -133,7 +164,7 @@ impl Corrector {
             "model": ep.model, "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": format!("{SYSTEM}{}", self.terms)},
+                {"role": "system", "content": format!("{}{}", self.system, self.terms)},
                 {"role": "user", "content": format!("<transcript>\n{text}\n</transcript>")}
             ]
         });
@@ -367,7 +398,7 @@ mod tests {
         });
         let ep = |api: &str, url: &str| Endpoint { api: api.into(), url: url.into(), model: "m".into(), key: "k".into(), extra: serde_json::json!({}) };
         let c = Corrector { endpoints: vec![ep("down", "http://127.0.0.1:1/x"), ep("up", &url)],
-            timeout: Duration::from_secs(5), terms: String::new(), meter: None, skip_file: None };
+            timeout: Duration::from_secs(5), system: system_prompt(false), terms: String::new(), meter: None, skip_file: None };
         assert_eq!(c.correct("please try deep sea on the bench later today").unwrap(), "please try DeepSeek on the bench later today");
     }
 
@@ -395,13 +426,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dictate-skip-{}", std::process::id()));
         let ep = |api: &str, path: &str| Endpoint { api: api.into(), url: format!("{url}/{path}"), model: "m".into(), key: "k".into(), extra: serde_json::json!({}) };
         let c = Corrector { endpoints: vec![ep("groq", "main"), ep("openrouter", "fallback")],
-            timeout: Duration::from_secs(5), terms: String::new(), meter: None, skip_file: Some(dir.join("skip.txt")) };
+            timeout: Duration::from_secs(5), system: system_prompt(false), terms: String::new(), meter: None, skip_file: Some(dir.join("skip.txt")) };
         let text = "one two three four five six seven";
         assert_eq!(c.correct(text).unwrap(), text);
         assert_eq!(c.correct(text).unwrap(), text);
         let paths: Vec<String> = hits.lock().unwrap().iter().map(|l| l.split(' ').nth(1).unwrap_or("").to_string()).collect();
         assert_eq!(paths, ["/v1/main", "/v1/fallback", "/v1/fallback"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn format_rule_goes_before_output_instructions() {
+        let s = system_prompt(true);
+        assert!(s.find("Wrap in\nbackticks").unwrap() < s.find("Do not repeat").unwrap());
+        assert!(s.ends_with("Glossary: "));
+        assert!(!system_prompt(false).contains("backticks"));
     }
 
     #[test]
