@@ -103,6 +103,25 @@ pub fn peak_db(samples: &[i16]) -> f32 {
     if peak == 0 { -91.0 } else { 20.0 * (peak as f32 / 32768.0).log10() }
 }
 
+/// How loud the speech in a clip is: the 95th percentile of 100 ms RMS
+/// levels in dBFS, so pauses don't pull it down and one shout doesn't push
+/// it up. About -20 at a good gain, -32 when it is turned too low.
+pub fn speech_db(samples: &[i16]) -> f32 {
+    let mut levels: Vec<f32> = samples.chunks_exact(RATE as usize / 10)
+        .map(|b| 10.0 * (energy(b) as f32 / b.len() as f32 / (32768.0 * 32768.0)).max(1e-10).log10())
+        .collect();
+    if levels.is_empty() {
+        return -100.0;
+    }
+    levels.sort_by(f32::total_cmp);
+    levels[levels.len() * 95 / 100]
+}
+
+/// Samples at (or within a hair of) full scale: the converter clipped.
+pub fn clipped_samples(samples: &[i16]) -> usize {
+    samples.iter().filter(|&&s| s.unsigned_abs() >= 32700).count()
+}
+
 fn energy(block: &[i16]) -> u64 {
     block.iter().map(|&s| (s as i64 * s as i64) as u64).sum()
 }
@@ -110,6 +129,15 @@ fn energy(block: &[i16]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_level_ignores_pauses() {
+        let mut s = vec![0i16; RATE as usize * 3];
+        s.extend((0..RATE as usize).map(|i| if i % 2 == 0 { 3277 } else { -3277 }));
+        assert!((speech_db(&s) + 20.0).abs() < 0.5, "{}", speech_db(&s));
+        assert_eq!(clipped_samples(&s), 0);
+        assert_eq!(clipped_samples(&[32767, -32768, 100]), 2);
+    }
 
     fn tone(secs: f64) -> Vec<i16> {
         (0..(secs * RATE as f64) as usize).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect()

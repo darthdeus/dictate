@@ -105,14 +105,17 @@ DIFF_SIZE = 15
 ROW_H = 34
 DIM = (0.48, 0.54, 0.62)
 BRIGHT = (0.89, 0.92, 0.96)
+# A row's optional fourth field colours its value (the mic level).
+ROW_COLORS = {"ok": (0.40, 0.88, 0.73), "warn": (1.0, 0.75, 0.30), "bad": (1.0, 0.42, 0.42)}
 
 
 def card_rows(state):
-    """Stats lines "label<TAB>value<TAB>unit" become table rows; others are notes."""
+    """Stats lines "label<TAB>value<TAB>unit[<TAB>color]" become table rows;
+    others are notes."""
     lines = state.get("stats", "").splitlines()
-    rows = [line.split("\t")+["", ""] for line in lines if "\t" in line]
+    rows = [line.split("\t")+["", "", ""] for line in lines if "\t" in line]
     notes = [line for line in lines if line and "\t" not in line]
-    return [r[:3] for r in rows], notes
+    return [r[:4] for r in rows], notes
 
 
 def card_text(state):
@@ -280,11 +283,12 @@ class Overlay(Gtk.Window):
         right = 32 + label_w + 28 + value_w
         for i, (label, value, unit) in enumerate(zip(labels, values, units)):
             row_y = y + i*ROW_H
+            tint = ROW_COLORS.get(rows[i][3], accent if i == 0 else BRIGHT)
             vw, vh = value.get_pixel_size()
             lh = label.get_pixel_size()[1]
             base = row_y + vh  # align label/unit baseline-ish with the number
             for layout, x, top, color in ((label, 32, base-lh-1, DIM),
-                                          (value, right-vw, row_y, accent if i == 0 else BRIGHT),
+                                          (value, right-vw, row_y, tint),
                                           (unit, right+7, base-lh-1, DIM)):
                 cr.set_source_rgb(*color)
                 cr.move_to(x, top)

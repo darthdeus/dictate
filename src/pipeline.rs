@@ -818,12 +818,31 @@ fn release_marks(ctx: &Ctx) -> Vec<(String, f64)> {
 
 /// The finished-dictation card: the text plus how long each stage took, the
 /// models and the history id, so a slow or wrong dictation can be looked up.
+/// The card's mic row, coloured by the renderer (fourth field): the speech
+/// level, and a warning when the input clipped or the gain is too low (at
+/// -32 dB quiet endings fell under the pause detector's -30 dBFS).
+fn mic_row(samples: &[i16]) -> String {
+    let level = wav::speech_db(samples);
+    // A clipped word or two is a loud laugh; more is the gain.
+    if wav::clipped_samples(samples) >= 3 {
+        format!("mic\tclipped\t{level:.0} dB\tbad")
+    } else if level < -28.0 {
+        format!("mic\tquiet\t{level:.0} dB\twarn")
+    } else {
+        format!("mic\t{level:.0}\tdB\tok")
+    }
+}
+
 fn notify_done(ctx: &Ctx, label: &str, raw: &str, text: &str, entry: Option<&Path>, audio_secs: f64) {
     let marks = release_marks(ctx);
     let at = |e: &str| marks.iter().find(|(n, _)| n == e).map(|(_, t)| *t);
     let span = |a: &str, b: &str| Some((at(b)? - at(a)?) * 1000.0);
     // Rows of "label\tvalue\tunit" for the card's table; a line without tabs is a note.
     let mut parts = vec![format!("total\t{:.2}\ts", now_unix() - ctx.command_started)];
+    let wav = entry.map(|e| e.join("audio.wav")).filter(|p| p.exists()).unwrap_or_else(|| ctx.paths.wav.clone());
+    if let Ok(samples) = wav::read_mono16(&wav) {
+        parts.push(mic_row(&samples));
+    }
     let engine = if ctx.c("DICTATE_FINAL", "whisper") == "elevenlabs" { "elevenlabs" } else { "whisper" };
     let tail = ctx.tail.get();
     if at("early_pass_used").is_some() {
