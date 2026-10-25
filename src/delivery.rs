@@ -209,6 +209,28 @@ impl Xdotool {
     /// On success appends `paste_shortcut_sent` to the release-timing TSV
     /// (bash `release_mark`); `timing` is `None` outside `stop` (e.g. retry),
     /// where no TSV is active.
+    pub fn active_window_pid(&self) -> Option<u32> {
+        std::process::Command::new(&self.bin)
+            .args(["getactivewindow", "getwindowpid"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+    }
+
+    /// `xdotool key` for `keys`, one chord each.
+    pub fn key(&self, keys: &[&str], delay_secs: &str) -> Result<()> {
+        let ms = paste_delay_ms(delay_secs).to_string();
+        let status = std::process::Command::new(&self.bin)
+            .args(["key", "--clearmodifiers", "--delay", &ms])
+            .args(keys)
+            .status()
+            .context("dictate: xdotool key failed")?;
+        if !status.success() {
+            anyhow::bail!("dictate: xdotool key failed");
+        }
+        Ok(())
+    }
+
     pub fn send_paste(&self, chord: &str, delay_secs: &str, timing: Option<&Path>) -> Result<()> {
         let ms = paste_delay_ms(delay_secs).to_string();
         let status = std::process::Command::new(&self.bin)

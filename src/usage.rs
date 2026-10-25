@@ -123,6 +123,74 @@ pub fn record_dictation(state_dir: &Path, d: &Dictation) {
     append(&state_dir.join("metrics.jsonl"), d);
 }
 
+/// One `dictate hotkey` action (`keys.jsonl`): which key did what where, so
+/// the bindings can be tuned to how they are used.
+#[derive(Serialize, Deserialize, Default)]
+pub struct KeyPress {
+    pub ts: f64,
+    /// `f17`, or the X keycode for keys outside f13-f24.
+    pub key: String,
+    /// The binding, as written in `DICTATE_HOTKEYS` (`talk`, `key:Return`).
+    pub action: String,
+    #[serde(default)]
+    pub layer: u8,
+    /// Class of the focused window.
+    pub app: String,
+    /// Command in the focused tmux pane, when there is one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pane: String,
+    /// Talk keys: seconds held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<f64>,
+}
+
+pub fn log_key(state_dir: &Path, row: &KeyPress) {
+    append(&state_dir.join("keys.jsonl"), row);
+}
+
+/// `dictate keys [days]`: use per action and where, then what follows what.
+pub fn summarize_keys(state_dir: &Path, days: f64) -> Result<String> {
+    let since = crate::pipeline::now_unix() - days * 86400.0;
+    let mut rows: Vec<KeyPress> = read(&state_dir.join("keys.jsonl"), since, |k: &KeyPress| k.ts);
+    rows.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+    let mut out = format!("Last {days} days: {} key actions\n\n", rows.len());
+    let label = |k: &KeyPress| if k.layer > 0 { format!("{} (layer {})", k.action, k.layer) } else { k.action.clone() };
+    let mut by: BTreeMap<String, (String, BTreeMap<String, usize>)> = BTreeMap::new();
+    for k in &rows {
+        let e = by.entry(label(k)).or_insert_with(|| (k.key.clone(), BTreeMap::new()));
+        *e.1.entry(if k.pane.is_empty() { k.app.clone() } else { k.pane.clone() }).or_default() += 1;
+    }
+    let mut actions: Vec<_> = by.iter().map(|(a, (key, apps))| (apps.values().sum::<usize>(), a, key, apps)).collect();
+    actions.sort_by(|a, b| b.0.cmp(&a.0));
+    out += "action                       key     count  where\n";
+    for (n, action, key, apps) in &actions {
+        let mut apps: Vec<_> = apps.iter().collect();
+        apps.sort_by(|a, b| b.1.cmp(a.1));
+        let wher = apps.iter().take(4).map(|(a, c)| format!("{a} {c}")).collect::<Vec<_>>().join(", ");
+        out += &format!("{action:<28} {key:<7} {n:>5}  {wher}\n");
+    }
+    let held: Vec<f64> = rows.iter().filter_map(|k| k.held).collect();
+    if let (Some(p50), Some(p90)) = (pct(held.clone(), 0.5), pct(held, 0.9)) {
+        out += &format!("\ntalk held: p50 {p50:.1} s, p90 {p90:.1} s\n");
+    }
+    // Pairs within 30 s: habits worth a single button (talk then Enter).
+    let mut pairs: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for w in rows.windows(2) {
+        if w[1].ts - w[0].ts <= 30.0 {
+            *pairs.entry((label(&w[0]), label(&w[1]))).or_default() += 1;
+        }
+    }
+    let mut pairs: Vec<_> = pairs.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    if !pairs.is_empty() {
+        out += "\nthen within 30 s\n";
+        for ((a, b), n) in pairs.iter().take(10) {
+            out += &format!("  {a} -> {b}: {n}\n");
+        }
+    }
+    Ok(out)
+}
+
 fn append<T: Serialize>(file: &Path, row: &T) {
     if let (Ok(line), Ok(mut f)) = (serde_json::to_string(row),
         std::fs::OpenOptions::new().create(true).append(true).open(file)) {

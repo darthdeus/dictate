@@ -92,16 +92,27 @@ impl X {
         Ok(Self { conn, root, win, atoms })
     }
 
-    /// `xdotool getactivewindow getwindowclassname`: the class half of the
-    /// focused window's WM_CLASS, or "" when there is no EWMH active window.
-    pub fn active_window_class(&self) -> String {
-        let active = self
-            .conn
+    /// `_NET_WM_PID` of the EWMH active window.
+    pub fn active_window_pid(&self) -> Option<u32> {
+        let w = self.active_window()?;
+        let pid_atom = self.conn.intern_atom(false, b"_NET_WM_PID").ok()?.reply().ok()?.atom;
+        let r = self.conn.get_property(false, w, pid_atom, AtomEnum::CARDINAL, 0, 1).ok()?.reply().ok()?;
+        r.value32().and_then(|mut v| v.next())
+    }
+
+    fn active_window(&self) -> Option<Window> {
+        self.conn
             .get_property(false, self.root, self.atoms.net_active_window, AtomEnum::WINDOW, 0, 1)
             .ok()
             .and_then(|c| c.reply().ok())
-            .and_then(|r| r.value32().and_then(|mut v| v.next()));
-        let Some(w) = active.filter(|&w| w != NONE) else { return String::new() };
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .filter(|&w| w != NONE)
+    }
+
+    /// `xdotool getactivewindow getwindowclassname`: the class half of the
+    /// focused window's WM_CLASS, or "" when there is no EWMH active window.
+    pub fn active_window_class(&self) -> String {
+        let Some(w) = self.active_window() else { return String::new() };
         let class = self
             .conn
             .get_property(false, w, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)

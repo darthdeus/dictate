@@ -22,9 +22,20 @@ enum Command {
         mode: Option<String>,
     },
     /// Stop, transcribe, deliver to focused window
-    Stop,
+    Stop {
+        /// End the sentence after the text (". "), not the paragraph
+        #[arg(long)]
+        sentence: bool,
+    },
     /// Start if idle, stop if recording
     Toggle,
+    /// Hotkey use over the last DAYS: per action and app, and what follows what
+    Keys {
+        #[arg(default_value = "30")]
+        days: f64,
+    },
+    /// Discard the recording in progress (the key release's stop then does nothing)
+    Cancel,
     /// Visual-only overlay walkthrough (no mic/transcribe)
     Demo,
     /// Summarize preview or release-to-paste performance
@@ -50,6 +61,8 @@ enum Command {
     Serve,
     /// Run the streaming preview engine in foreground (start/stop use it)
     Daemon,
+    /// Push-to-talk on F19 (keycode 197) without a key grab: start on press, stop on release
+    Hotkey,
     /// Per-channel levels to find mic on multi-input interface
     Scan {
         #[arg(default_value = "6")]
@@ -87,6 +100,9 @@ enum Command {
         verbose: bool,
         wavs: Vec<std::path::PathBuf>,
     },
+    /// Hidden: apply a spoken edit instruction to a text, as the mid-dictation edit does
+    #[command(hide = true)]
+    EditText { text: String, instruction: String },
     /// Hidden: live-preview scheduler (spawned by `start`)
     #[command(hide = true)]
     PreviewWorker,
@@ -160,11 +176,27 @@ fn main() -> anyhow::Result<()> {
             let c = ctx()?;
             pipeline::cmd_start(&c, mode.as_deref() == Some("llm"))?;
         }
-        Command::Stop => {
+        Command::Stop { sentence } => {
             let c = ctx()?;
+            if sentence {
+                c.join.set(dictate_lib::target::Join::Sentence);
+            }
             let res = pipeline::cmd_stop(&c);
             pipeline::log_release_summary(&c);
             res?;
+        }
+        Command::EditText { text, instruction } => {
+            let c = ctx()?;
+            let corrector = dictate_lib::correct::Corrector::from_config(&c.cfg, &c.terms())?;
+            // The daemon's edit timeout.
+            let corrector = dictate_lib::correct::Corrector { timeout: corrector.timeout.max(std::time::Duration::from_secs(8)), ..corrector };
+            println!("{}", corrector.edit(&text, &instruction)?);
+        }
+        Command::Keys { days } => {
+            print!("{}", dictate_lib::usage::summarize_keys(&ctx()?.state_dir(), days)?);
+        }
+        Command::Cancel => {
+            pipeline::cmd_cancel(&ctx()?)?;
         }
         Command::Toggle => {
             pipeline::cmd_toggle(&ctx()?)?;
@@ -181,6 +213,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Meter => {
             pipeline::cmd_meter(&ctx()?)?;
+        }
+        Command::Hotkey => {
+            dictate_lib::hotkey::run()?;
         }
         Command::Daemon => {
             dictate_lib::daemon::run(&ctx)?;

@@ -131,18 +131,46 @@ def rounded(cr, x, y, w, h, r):
     cr.close_path()
 
 
+def silhouette(w, h, radius=24):
+    """Rounded-rectangle window shape: without a compositor the corners
+    outside the drawing would show."""
+    region = cairo.Region()
+    for y in range(h):
+        dy = max(radius-y-0.5, y-(h-radius)+0.5, 0)
+        inset = math.ceil(radius-math.sqrt(max(0, radius*radius-dy*dy)))
+        region.union(cairo.RectangleInt(inset, y, w-2*inset, 1))
+    return region
+
+
+def popup(win):
+    """A window that never takes focus or clicks (see Overlay.__init__)."""
+    win.set_wmclass("dictate-osd", "dictate-osd")
+    win.set_accept_focus(False)
+    win.set_focus_on_map(False)
+    win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_decorated(False)
+
+
+def monitor_rect(win):
+    """Geometry of the monitor with the active window (else the pointer)."""
+    display = win.get_display()
+    active = win.get_screen().get_active_window()
+    if active:
+        monitor = display.get_monitor_at_window(active)
+    else:
+        _, x, y = display.get_default_seat().get_pointer().get_position()
+        monitor = display.get_monitor_at_point(x, y)
+    return monitor.get_geometry()
+
+
 class Overlay(Gtk.Window):
     def __init__(self, path):
         # POPUP is override-redirect: i3 never manages/focuses this window.
         super().__init__(type=Gtk.WindowType.POPUP)
-        self.set_wmclass("dictate-osd", "dictate-osd")
+        popup(self)
         self.set_title("Dictation")
-        self.set_accept_focus(False)
-        self.set_focus_on_map(False)
-        self.set_keep_above(True)
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        self.set_decorated(False)
         self.path = Path(path)
         self.stamp = None
         self.state = {}
@@ -199,24 +227,10 @@ class Overlay(Gtk.Window):
 
     def reshape(self):
         # Rebuild the silhouette after resizing; preserve the empty input shape.
-        win = self.get_window()
-        region = cairo.Region()
-        radius = 24
-        for y in range(self.h):
-            dy = max(radius-y-0.5, y-(self.h-radius)+0.5, 0)
-            inset = math.ceil(radius-math.sqrt(max(0, radius*radius-dy*dy)))
-            region.union(cairo.RectangleInt(inset, y, self.w-2*inset, 1))
-        win.shape_combine_region(region, 0, 0)
+        self.get_window().shape_combine_region(silhouette(self.w, self.h), 0, 0)
 
     def position(self):
-        display = self.get_display()
-        active = self.get_screen().get_active_window()
-        if active:
-            monitor = display.get_monitor_at_window(active)
-        else:
-            _, x, y = display.get_default_seat().get_pointer().get_position()
-            monitor = display.get_monitor_at_point(x, y)
-        rect = monitor.get_geometry()
+        rect = monitor_rect(self)
         self.monitor_rect = rect
         self.w = COMPACT_W if compact(self.state) else self.full_w
         self.clickable(compact(self.state))
@@ -533,6 +547,102 @@ class Overlay(Gtk.Window):
         return False
 
 
+class LayerGrid(Gtk.Window):
+    """The macro pad's second layer while its layer key is held: a 2x3 grid
+    of what each button does now, right of the dictation panel. Driven by
+    `layer.json` beside `state.json` (written by `dictate hotkey`):
+    `{active, ts, cells: [{label, base, kind}] x 6}`, cells row by row from
+    the top left; `kind` is `layer` (the held key), `action` or `empty`."""
+
+    CELL_W, CELL_H, GAP, HEAD = 220, 78, 10, 46
+
+    def __init__(self, overlay, path):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        popup(self)
+        self.set_title("Dictation layer")
+        self.overlay = overlay
+        self.path = Path(path)
+        self.stamp = None
+        self.state = {}
+        self.w = 2*self.CELL_W+3*self.GAP
+        self.h = self.HEAD+3*self.CELL_H+4*self.GAP
+        self.set_default_size(self.w, self.h)
+        area = Gtk.DrawingArea()
+        area.connect("draw", self.draw)
+        self.add(area)
+        self.connect("realize", self.realized)
+        GLib.timeout_add(33, self.tick)
+
+    def realized(self, _):
+        self.input_shape_combine_region(cairo.Region())
+        self.get_window().set_pass_through(True)
+        self.get_window().shape_combine_region(silhouette(self.w, self.h, 18), 0, 0)
+
+    def tick(self):
+        try:
+            stamp = self.path.stat().st_mtime_ns
+            if stamp != self.stamp:
+                self.stamp = stamp
+                self.state = json.loads(self.path.read_text())
+                self.queue_draw()
+        except (OSError, ValueError):
+            self.state = {}
+        # A listener that died mid-hold must not leave the grid up.
+        active = self.state.get("active") and time.time()-self.state.get("ts", 0) < 30
+        if active and not self.get_visible():
+            rect = monitor_rect(self)
+            panel_right = rect.x+(rect.width+self.overlay.full_w)//2
+            x = min(panel_right+24, rect.x+rect.width-self.w-24)
+            self.move(x, rect.y+24)
+            self.show_all()
+        elif not active and self.get_visible():
+            self.hide()
+        if self.get_visible():
+            # Keeps the renderer from quitting idle while the grid is up.
+            self.overlay.last_seen = time.monotonic()
+        return True
+
+    def label(self, cr, text, x, y, size, color, bold=False):
+        layout = PangoCairo.create_layout(cr)
+        font = Pango.FontDescription()
+        font.set_family(os.getenv("DICTATE_OSD_FONT", "DejaVu Sans"))
+        font.set_absolute_size(size*Pango.SCALE)
+        font.set_weight(Pango.Weight.BOLD if bold else Pango.Weight.NORMAL)
+        layout.set_font_description(font)
+        layout.set_text(text, -1)
+        layout.set_width((self.CELL_W-28)*Pango.SCALE)
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        cr.set_source_rgb(*color)
+        cr.move_to(x, y)
+        PangoCairo.show_layout(cr, layout)
+
+    def draw(self, _, cr):
+        accent = (0.65, 0.64, 1.0)
+        cr.set_source_rgb(0.055, 0.067, 0.09)
+        cr.paint()
+        rounded(cr, 1, 1, self.w-2, self.h-2, 17)
+        cr.set_source_rgb(0.19, 0.22, 0.27)
+        cr.set_line_width(1.5)
+        cr.stroke()
+        self.label(cr, self.state.get("title", "LAYER 2"), 22, 14, LABEL_SIZE, accent, bold=True)
+        for i, cell in enumerate(self.state.get("cells", [])[:6]):
+            x = self.GAP+(i % 2)*(self.CELL_W+self.GAP)
+            y = self.HEAD+self.GAP+(i//2)*(self.CELL_H+self.GAP)
+            kind = cell.get("kind", "action")
+            rounded(cr, x, y, self.CELL_W, self.CELL_H, 12)
+            if kind == "layer":
+                cr.set_source_rgba(*accent, 0.28)
+            else:
+                cr.set_source_rgb(0.09, 0.11, 0.14)
+            cr.fill()
+            color = DIM if kind == "empty" else (accent if kind == "layer" else BRIGHT)
+            self.label(cr, cell.get("label", ""), x+14, y+12, 20, color, bold=kind != "empty")
+            if cell.get("base"):
+                self.label(cr, cell["base"], x+14, y+46, FOOT_SIZE, DIM)
+        return False
+
+
 if __name__ == "__main__":
     overlay = Overlay(sys.argv[1])
+    grid = LayerGrid(overlay, Path(sys.argv[1]).with_name("layer.json"))
     Gtk.main()

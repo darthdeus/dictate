@@ -103,8 +103,10 @@ Set `DICTATE_CONFIG=/path/to/config.toml` to use another profile. Set
 dictate start       # begin capture
 dictate stop        # transcribe and deliver
 dictate toggle      # start or stop
+dictate cancel      # discard the recording in progress
 dictate daemon      # resident streaming engine (live preview, pause pass)
 dictate serve       # resident whisper server
+dictate hotkey      # X11 push-to-talk on F19 without a key grab
 dictate demo        # show the overlay without recording
 dictate history     # list recoverable dictations
 dictate retry latest
@@ -112,9 +114,37 @@ dictate replay 50   # re-run saved recordings through the text path, read-only
 ```
 
 Bind `start` and `stop` to a press/release key in the desktop environment of
-your choice. The keyd → sxhkd → F19 chain is one example integration, not a
-requirement; any input tool that invokes `start` on press and `stop` on release
+your choice; any input tool that invokes `start` on press and `stop` on release
 can be used. The overlay is designed not to take focus or intercept clicks.
+
+On X11, `dictate hotkey` is a built-in binding for F19 (keycode 197; e.g. Caps
+Lock mapped to F19 by keyd). Hotkey daemons like sxhkd grab the key, and while
+a grabbed key is held X sends the focused window a grab FocusOut, which
+terminals such as Alacritty draw as unfocused for the whole dictation.
+`dictate hotkey` reads XInput2 raw key events instead (no grab), clears the
+key's keysyms so apps ignore it, and runs `start`/`stop` on press/release.
+Run it as part of the X session, e.g. a systemd user service. Shift held on
+the key runs `stop --sentence` (see below). `DICTATE_HOTKEYS` binds more keys,
+e.g. a macro pad mapped onto F13-F24 with keyd: `talk`, `talk-sentence`,
+`cancel` (discard the recording in progress), `retry` (re-paste the last
+dictation), `window-prev`/`window-next` and `pane-prev`/`pane-next` (move in
+the focused terminal's tmux) and `key:<chord>` (send a chord, e.g. `key:alt+BackSpace`). The
+listener re-reads the config file when it changes, so no restart is needed.
+A `layer` key switches to `DICTATE_HOTKEYS_LAYER2` while held and shows those
+bindings as a grid beside the dictation panel (F13-F18 as a 2x3 macro pad).
+
+`edit` (with `dictate daemon`): hold it during a dictation and say an
+instruction about what you said so far ("no, make that Tuesday", "drop the
+last sentence"). On release the correction model applies it in the background
+and the overlay shows the edited text; keep talking, and the release of the
+talk key pastes the edited start plus the rest.
+
+After the text, dictate leaves the input ready for the next dictation. In
+`DICTATE_PARAGRAPH_APPS` (default `claude|codex`, matched against the command
+in the focused tmux pane) it sends Ctrl+J twice, a new paragraph; elsewhere a
+space (never Ctrl+J: in a shell that is Enter). `stop --sentence` ends the
+sentence instead: `. `, or a space after the text's own `.`, `?` or `!`.
+`DICTATE_JOIN=off` pastes the text alone.
 
 With `dictate daemon` running, the live preview comes from the Nemotron
 streaming model (transcribe.cpp, `DICTATE_STREAM_MODEL`), and the final pass

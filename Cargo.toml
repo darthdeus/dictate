@@ -27,7 +27,7 @@ transcribe-cpp = { git = "https://github.com/darthdeus/transcribe.cpp", rev = "6
 ureq = { version = "2", features = ["json"] }
 # Pure-Rust X11 client: clipboard ownership and window class without
 # spawning copyq/xclip/xdotool on the paste path.
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xinput"] }
 
 [dev-dependencies]
 tempfile = "3"

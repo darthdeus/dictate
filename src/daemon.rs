@@ -20,7 +20,19 @@
 //! Protocol, one request line and one reply line:
 //!   start  -> ok | busy | error <why>
 //!   stop   -> ok <seconds> [early] | idle | error <why>
+//!   cancel -> ok | idle    (the recording is discarded)
+//!   edit-start, edit-end -> ok | idle
 //!   status -> recording | idle
+//!
+//! Mid-dictation edit: between `edit-start` and `edit-end` you speak an
+//! instruction about what you dictated so far ("no, make that Tuesday").
+//! At `edit-end` the audio before it and the instruction are cut off the
+//! recording; in the background whisper recognizes both and the correction
+//! model applies the instruction (`Corrector::edit`), and the result is the
+//! fixed start of the dictation (the "base"), shown on the overlay. The live
+//! stream and pause passes start over on the audio after the cut. `stop`
+//! leaves the base at `edit_base_path` for the stop process to put in front
+//! of what it recognizes.
 
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -102,11 +114,16 @@ struct Recording {
     stop: Arc<AtomicBool>,
     wav: PathBuf,
     early_path: PathBuf,
+    edit_base: PathBuf,
+    /// `edit-start` (true) and `edit-end` (false) requests, for the capture
+    /// thread to act on between chunks.
+    edits: Arc<std::sync::Mutex<Vec<bool>>>,
     thread: JoinHandle<(Session, Result<Captured>)>,
 }
 
-/// The clip, and the pause pass that covers it if one finished.
-type Captured = (Vec<i16>, Option<EarlyPass>);
+/// The clip after the last edit, the pause pass that covers it if one
+/// finished, and the edited text before it.
+type Captured = (Vec<i16>, Option<EarlyPass>, Option<String>);
 
 /// `dictate daemon`: serve until killed. `load_ctx` is called per recording,
 /// so config edits apply to the next dictation without a restart.
@@ -155,6 +172,20 @@ pub fn run(load_ctx: &dyn Fn() -> Result<Ctx>) -> Result<()> {
                     let (s, reply) = stop(r);
                     session = Some(s);
                     reply
+                }
+            },
+            "cancel" => match recording.take() {
+                None => "idle".to_string(),
+                Some(r) => {
+                    session = Some(cancel(r));
+                    "ok".to_string()
+                }
+            },
+            "edit-start" | "edit-end" => match &recording {
+                None => "idle".to_string(),
+                Some(r) => {
+                    r.edits.lock().unwrap().push(line.trim() == "edit-start");
+                    "ok".to_string()
                 }
             },
             "status" => if recording.is_some() { "recording" } else { "idle" }.to_string(),
@@ -206,16 +237,20 @@ fn start(ctx: Ctx, session: Session) -> std::result::Result<Recording, (Session,
     let wav = ctx.paths.wav.clone();
     let early_path = early_pass_path(&ctx.paths);
     let _ = std::fs::remove_file(&early_path);
+    let edit_base = edit_base_path(&ctx.paths);
+    let _ = std::fs::remove_file(&edit_base);
     let flag = stop.clone();
+    let edits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let marks = edits.clone();
     let thread = std::thread::spawn(move || {
         let mut session = session;
-        let res = capture(&ctx, &mut session, child, channels, chan, &flag);
+        let res = capture(&ctx, &mut session, child, channels, chan, &flag, &marks);
         if let Err(e) = &res {
             append_log(&ctx.log, &format!("dictate daemon: capture failed: {e:#}"));
         }
         (session, res)
     });
-    Ok(Recording { recorder, pidfile, stop, wav, early_path, thread })
+    Ok(Recording { recorder, pidfile, stop, wav, early_path, edit_base, edits, thread })
 }
 
 fn stop(r: Recording) -> (Session, String) {
@@ -225,8 +260,11 @@ fn stop(r: Recording) -> (Session, String) {
     crate::state::send_int(r.recorder);
     let (session, res) = r.thread.join().expect("dictate daemon: capture thread panicked");
     let _ = std::fs::remove_file(&r.pidfile);
-    let reply = match res.and_then(|(audio, early)| {
+    let reply = match res.and_then(|(audio, early, base)| {
         wav::write_mono16(&r.wav, &audio)?;
+        if let Some(base) = base {
+            std::fs::write(&r.edit_base, base)?;
+        }
         let early = match early {
             Some(e) => std::fs::write(&r.early_path, serde_json::to_vec(&e)?).is_ok(),
             None => false,
@@ -240,10 +278,19 @@ fn stop(r: Recording) -> (Session, String) {
     (session, reply)
 }
 
+/// Ends a recording like `stop` but keeps nothing: no wav, no early pass.
+fn cancel(r: Recording) -> Session {
+    r.stop.store(true, Ordering::SeqCst);
+    crate::state::send_int(r.recorder);
+    let (session, _) = r.thread.join().expect("dictate daemon: capture thread panicked");
+    let _ = std::fs::remove_file(&r.pidfile);
+    session
+}
+
 /// Reads the recorder until EOF (stop) or `DICTATE_MAX_SECS`, feeding the
 /// model 160 ms at a time and publishing each change of the preview.
-fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, chan: usize, stop: &AtomicBool)
-    -> Result<Captured> {
+fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, chan: usize, stop: &AtomicBool,
+    marks: &std::sync::Mutex<Vec<bool>>) -> Result<Captured> {
     let mut out = child.stdout.take().context("recorder has no stdout")?;
     let frame = channels * 2;
     let chunk_bytes = RATE as usize * CHUNK_MS / 1000 * frame;
@@ -265,6 +312,10 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     // much buffered audio was still fed to the model after it.
     let mut stop_seen: Option<Instant> = None;
     let mut fed_after_stop = 0usize;
+    let mut editor = Editor::default();
+    // While an edit instruction is spoken: where it starts in `audio`, and
+    // how much of the stream's committed text came before it.
+    let mut instruction: Option<(usize, usize)> = None;
     while !eof && audio.len() < max_samples {
         if stop_seen.is_none() && stop.load(Ordering::SeqCst) {
             stop_seen = Some(Instant::now());
@@ -299,15 +350,48 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
             fed_after_stop += mono.len();
             continue;
         }
+        let mut redraw = false;
+        for start in std::mem::take(&mut *marks.lock().unwrap()) {
+            match (start, instruction) {
+                (true, None) => instruction = Some((audio.len(), stream.text().committed.len())),
+                (false, Some((from, _))) => {
+                    instruction = None;
+                    editor.apply(ctx, &mut audio, from);
+                    // What follows the cut is a fresh dictation.
+                    early = EarlyWorker::new(ctx);
+                    drop(stream);
+                    stream = session.stream(&run, &opts)?;
+                }
+                _ => {}
+            }
+            redraw = true;
+        }
+        redraw |= editor.poll();
         let t = stream.text();
-        let early_changed = early.heard(&audio, &t.committed, &t.tentative);
+        // The instruction is not dictation: pause passes skip it.
+        let early_changed = instruction.is_none() && early.heard(&audio, &t.committed, &t.tentative);
         let pcm: Vec<f32> = mono.iter().map(|&s| s as f32 / 32768.0).collect();
         let update = stream.feed(&pcm)?;
-        if update.committed_changed || update.tentative_changed || early_changed {
+        if update.committed_changed || update.tentative_changed || early_changed || redraw {
             let t = stream.text();
-            let (committed, tentative) = early.preview(&t.committed, &t.tentative);
-            overlay.show(&fixes.apply(&committed), &fixes.apply(&tentative));
+            match instruction {
+                Some((_, before)) => {
+                    let said = format!("{}{}", t.committed.get(before..).unwrap_or(""), t.tentative);
+                    overlay.show_as("Edit instruction", &editor.text(), &fixes.apply(&said));
+                }
+                None => {
+                    let (committed, tentative) = early.preview(&t.committed, &t.tentative);
+                    let committed = crate::segment::join(&editor.text(), &fixes.apply(&committed));
+                    let label = if editor.pending() { "Applying edit" } else { "Listening" };
+                    overlay.show_as(label, &committed, &fixes.apply(&tentative));
+                }
+            }
         }
+    }
+    // Released while still speaking the instruction: it ends here.
+    if let Some((from, _)) = instruction {
+        editor.apply(ctx, &mut audio, from);
+        early = EarlyWorker::new(ctx);
     }
     let eof_at = Instant::now();
     let _ = child.kill();
@@ -323,7 +407,97 @@ fn capture(ctx: &Ctx, session: &mut Session, mut child: Child, channels: usize, 
     append_log(&ctx.log, &format!("{} daemon: {:.1}s captured; stop: eof +{:.0} ms ({:.0} ms audio kept after stop), early finish {:.0} ms",
         crate::history::local_iso_now(), audio.len() as f64 / RATE as f64,
         stop_seen.map(|s| ms(eof_at - s)).unwrap_or(-1.0), fed_after_stop as f64 * 1000.0 / RATE as f64, ms(t.elapsed())));
-    Ok((audio, early))
+    Ok((audio, early, editor.finish(&ctx.log)))
+}
+
+/// The mid-dictation edits of one recording: the edited text so far, and
+/// the edit being made in the background.
+#[derive(Default)]
+struct Editor {
+    base: Option<String>,
+    running: Option<JoinHandle<String>>,
+}
+
+impl Editor {
+    /// Cuts the dictation before `from` and the instruction after it off
+    /// `audio`, and starts applying the instruction in the background.
+    fn apply(&mut self, ctx: &Ctx, audio: &mut Vec<i16>, from: usize) {
+        let dictation = audio[..from].to_vec();
+        let instruction: Vec<i16> = audio.drain(..).skip(from).collect();
+        // Edits apply in order: this one starts from the previous result.
+        let previous = self.wait();
+        let pass = FinalPass::new(ctx, "edit");
+        // In the background while you keep talking: waiting beats losing it.
+        let corrector = crate::correct::Corrector::from_config(&ctx.cfg, &ctx.terms()).map(|c| crate::correct::Corrector {
+            timeout: c.timeout.max(Duration::from_secs(8)),
+            meter: Some(crate::usage::Meter::new(&ctx.state_dir(), &ctx.cfg, "edit")),
+            ..c
+        });
+        let log = ctx.log.clone();
+        self.running = Some(std::thread::spawn(move || {
+            // Whisper hears "..." in silence: no letters is nothing said.
+            let recognize = |samples: &[i16], context: Option<&str>| {
+                pass.recognize(samples, context).map(|t| crate::text::clean_whisper_text(&t))
+                    .map(|t| if t.chars().any(char::is_alphanumeric) { t } else { String::new() })
+            };
+            let spoken = recognize(&dictation, previous.as_deref()).unwrap_or_else(|e| {
+                append_log(&log, &format!("dictate daemon: edit: recognizing the dictation failed: {e:#}"));
+                String::new()
+            });
+            let text = crate::segment::join(previous.as_deref().unwrap_or(""), &spoken);
+            let edited = recognize(&instruction, None)
+                .and_then(|said| {
+                    append_log(&log, &format!("dictate daemon: edit instruction: {said}"));
+                    if said.trim().is_empty() || text.trim().is_empty() {
+                        return Ok(text.clone());
+                    }
+                    corrector.map_err(anyhow::Error::from)?.edit(&text, &said)
+                });
+            edited.unwrap_or_else(|e| {
+                append_log(&log, &format!("dictate daemon: edit failed, keeping the text: {e:#}"));
+                text
+            })
+        }));
+    }
+
+    /// Takes a finished edit's result; true when the text changed.
+    fn poll(&mut self) -> bool {
+        if self.running.as_ref().is_some_and(|t| t.is_finished()) {
+            self.base = self.running.take().and_then(|t| t.join().ok());
+            return true;
+        }
+        false
+    }
+
+    fn wait(&mut self) -> Option<String> {
+        if let Some(t) = self.running.take() {
+            self.base = t.join().ok();
+        }
+        self.base.clone()
+    }
+
+    fn pending(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// What the overlay shows before the live text.
+    fn text(&self) -> String {
+        self.base.clone().unwrap_or_default()
+    }
+
+    fn finish(mut self, log: &Path) -> Option<String> {
+        let t = Instant::now();
+        let base = self.wait();
+        if base.is_some() {
+            append_log(log, &format!("dictate daemon: edited base ready {:.0} ms after stop", t.elapsed().as_secs_f64() * 1000.0));
+        }
+        base
+    }
+}
+
+/// Where `stop` leaves the edited start of the dictation.
+pub fn edit_base_path(paths: &Paths) -> PathBuf {
+    paths.datadir.join("dictate-edit-base.txt")
 }
 
 /// Runs the final pass in the background whenever the speaker pauses.
@@ -565,13 +739,17 @@ struct Publisher<'a> {
 
 impl Publisher<'_> {
     fn show(&self, committed: &str, tentative: &str) {
+        self.show_as("Listening", committed, tentative)
+    }
+
+    fn show_as(&self, label: &str, committed: &str, tentative: &str) {
         if self.stop.load(Ordering::SeqCst) {
             return;
         }
         let max = self.ctx.max_secs() as f64;
         let msg = OverlayMessage {
             phase: Phase::Recording,
-            label: "Listening".into(),
+            label: label.into(),
             text: committed.trim_start().to_string(),
             engine: live_label(self.ctx),
             stats: String::new(),

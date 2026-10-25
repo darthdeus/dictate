@@ -20,6 +20,7 @@ use crate::correct::Corrector;
 use crate::daemon;
 use crate::delivery::{self, DeliveryAction, InputMode, OwnerWorker, PasteEngine, ProcessClipboard, Xdotool};
 use crate::x11::X;
+use crate::target::{self, Ending, Join};
 use crate::history::HistoryStore;
 use crate::overlay::{map_notify, JsonFileOverlay, OverlayBackend, OverlayMessage};
 use crate::paths::Paths;
@@ -43,6 +44,9 @@ pub struct Ctx {
     /// Set by an incremental `stop`: the daemon's pause segments used and
     /// the seconds of audio after them recognized at stop (0: none).
     pub tail: std::cell::Cell<Option<(usize, f64)>>,
+    /// What follows a dictation (`target`); `stop --sentence` sets
+    /// `Sentence`.
+    pub join: std::cell::Cell<Join>,
 }
 
 impl Ctx {
@@ -70,6 +74,7 @@ impl Ctx {
             command_started: now_unix(),
             timing_active: std::cell::Cell::new(false),
             tail: std::cell::Cell::new(None),
+            join: std::cell::Cell::new(Join::Paragraph),
         })
     }
 
@@ -126,7 +131,7 @@ impl Ctx {
     }
     /// Glossary for restyle and correction. Separate from the whisper
     /// prompt, which reads best as an example sentence.
-    fn terms(&self) -> String {
+    pub fn terms(&self) -> String {
         self.cfg.get("DICTATE_TERMS").map(str::to_string).unwrap_or_else(|| self.c("DICTATE_PROMPT", ""))
     }
     /// What produces the final text, shown on the overlay.
@@ -194,7 +199,7 @@ fn uid_string() -> String {
     })
 }
 
-fn overlay_state_path(rundir: &Path) -> PathBuf {
+pub(crate) fn overlay_state_path(rundir: &Path) -> PathBuf {
     rundir.join(format!("dictate-overlay-{}", uid_string())).join("state.json")
 }
 
@@ -242,7 +247,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
     spawn_renderer(ctx);
 }
 
-fn renderer_binary() -> String {
+pub(crate) fn renderer_binary() -> String {
     if let Ok(b) = std::env::var("DICTATE_OVERLAY_BIN") {
         if !b.is_empty() {
             return b;
@@ -344,6 +349,7 @@ pub fn reap_recorders() {
 
 /// `dictate start [llm]`. Idempotent: second call while recording is a no-op.
 pub fn cmd_start(ctx: &Ctx, llm_mode: bool) -> Result<()> {
+    let _ = std::fs::remove_file(cancelled_path(&ctx.paths));
     ctx.state.write_mode(if llm_mode { "llm" } else { "fast" })?;
     // A running daemon owns capture and the streaming preview; it publishes
     // to the overlay itself, so only the renderer needs starting here.
@@ -529,6 +535,36 @@ pub fn is_silence(peak_db: Option<f32>, min_peak_db: f64) -> bool {
     }
 }
 
+/// Left by `cancel` so the key release's `stop` does nothing; `start`
+/// clears a stale one.
+fn cancelled_path(paths: &Paths) -> PathBuf {
+    paths.rundir.join("dictate.cancelled")
+}
+
+/// `dictate cancel`: end the recording and discard it.
+pub fn cmd_cancel(ctx: &Ctx) -> Result<()> {
+    let cancelled = match daemon::request(&ctx.paths, "cancel").as_deref() {
+        Some("ok") => true,
+        _ if ctx.paths.pidfile.exists() => {
+            let pid = ctx.state.take_recorded_pid();
+            stop_preview(&ctx.paths);
+            if let Some(pid) = pid {
+                state::send_int(pid);
+                state::wait_exit(pid, 50);
+            }
+            let _ = std::fs::remove_file(&ctx.paths.raw);
+            true
+        }
+        _ => false,
+    };
+    if cancelled {
+        let _ = std::fs::remove_file(&ctx.paths.startfile);
+        std::fs::write(cancelled_path(&ctx.paths), "")?;
+        notify(ctx, "dictate: cancelled", "", 1200);
+    }
+    Ok(())
+}
+
 /// `dictate stop`: transcribe + deliver. Soft failures notify + Ok(());
 /// hard transcription failure returns Err (bash `return 1`).
 pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
@@ -538,6 +574,10 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<()> {
     let started_ts = ctx.command_started;
     ctx.mark_at("command_started", started_ts);
     ctx.mark("stop_entered");
+    // The release after `cancel`: that recording is already gone.
+    if std::fs::remove_file(cancelled_path(&ctx.paths)).is_ok() {
+        return Ok(());
+    }
     match daemon::request(&ctx.paths, "stop").as_deref() {
         Some(r) if r.starts_with("ok") => {
             ctx.mark("recorder_stopped");
@@ -647,7 +687,11 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     let dur = wav::read_mono16(&ctx.paths.wav)
         .map(|s| s.len() as f64 / wav::RATE as f64)
         .unwrap_or_else(|_| ffprobe_duration(&ctx.paths.wav));
-    if is_too_short(dur) {
+    // The edited start of the dictation (mid-dictation edits, see `daemon`):
+    // it goes before what is recognized now, or alone when nothing followed.
+    let base = std::fs::read_to_string(daemon::edit_base_path(&ctx.paths)).ok().filter(|b| !b.trim().is_empty());
+    let _ = std::fs::remove_file(daemon::edit_base_path(&ctx.paths));
+    if is_too_short(dur) && base.is_none() {
         if let Some(e) = &entry {
             ctx.history.set_status(e, "too-short");
         }
@@ -657,7 +701,22 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     notify(ctx, "\u{23f3} transcribing\u{2026}", "", 15000);
 
     let mode = ctx.state.take_mode();
-    let (raw, text) = match transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early) {
+    let outcome = if is_too_short(dur) {
+        Ok(TextOutcome::NoSpeech)
+    } else {
+        transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early)
+    };
+    let outcome = match (outcome, base) {
+        (Ok(TextOutcome::Ready { raw, text }), Some(b)) => Ok(TextOutcome::Ready {
+            raw: crate::segment::join(&b, &raw), text: crate::segment::join(&b, &text) }),
+        (Err(e), Some(b)) => {
+            append_log(&ctx.log, &format!("note: recognizing after the edit failed, pasting the edited text: {e:#}"));
+            Ok(TextOutcome::Ready { raw: b.clone(), text: b })
+        }
+        (Ok(_), Some(b)) => Ok(TextOutcome::Ready { raw: b.clone(), text: b }),
+        (outcome, None) => outcome,
+    };
+    let (raw, text) = match outcome {
         Err(e) => {
             notify(ctx, "dictate: transcription failed", "audio retained in history; see log", 4000);
             return Err(e);
@@ -1265,7 +1324,9 @@ pub fn deliver(ctx: &Ctx, text: &str) {
 fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
     let mode = InputMode::parse(&ctx.c("DICTATE_INPUT", "auto"));
     if mode == InputMode::Type {
-        let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+        let ending = ending_for(ctx, ctx.xdotool().active_window_pid());
+        let _ = ctx.xdotool().type_text(&ending.apply(text), &ctx.c("DICTATE_TYPE_DELAY", "4"));
+        send_ending(ctx, ending);
         return;
     }
     let p = prefetch.unwrap_or_default();
@@ -1283,14 +1344,34 @@ fn deliver_with(ctx: &Ctx, text: &str, prefetch: Option<DeliveryPrefetch>) {
     deliver_tools(ctx, text, mode, p.tools.and_then(|h| h.join().ok()));
 }
 
+/// What follows the dictation in the focused window (`target`).
+fn ending_for(ctx: &Ctx, window_pid: Option<u32>) -> Ending {
+    if ctx.c("DICTATE_JOIN", "smart") == "off" {
+        return Ending::None;
+    }
+    let command = window_pid.and_then(target::tmux_command);
+    target::plan(command.as_deref(), ctx.join.get(), &ctx.c("DICTATE_PARAGRAPH_APPS", "claude|codex"))
+}
+
+/// The keys an ending sends after the text (`Ending::apply` adds the rest).
+fn send_ending(ctx: &Ctx, ending: Ending) {
+    if ending == Ending::Paragraph {
+        let _ = ctx.xdotool().key(&["ctrl+j", "ctrl+j"], &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"));
+    }
+}
+
 /// The native engine. `Err` only before anything reached the window, so
 /// the caller can fall back to the tools engine.
 fn deliver_native(ctx: &Ctx, text: &str, mode: InputMode, x: &X, owner: Option<OwnerWorker>) -> Result<()> {
     let cls = x.active_window_class();
     ctx.mark("window_class_read");
+    let ending = ending_for(ctx, x.active_window_pid());
+    let joined = ending.apply(text);
+    let text = joined.as_str();
     let chord = match delivery::select_action(mode, &cls, &ctx.c("DICTATE_TERMINALS", delivery::DEFAULT_TERMINALS)) {
         DeliveryAction::Type => {
             let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+            send_ending(ctx, ending);
             return Ok(());
         }
         DeliveryAction::Paste { chord } => chord,
@@ -1310,10 +1391,12 @@ fn deliver_native(ctx: &Ctx, text: &str, mode: InputMode, x: &X, owner: Option<O
         // The worker still restores the previous clipboard when it settles.
         owner.pasted();
         let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+        send_ending(ctx, ending);
         return Ok(());
     }
     ctx.mark("clipboard_verified");
     let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), ctx.timing_tsv());
+    send_ending(ctx, ending);
     owner.pasted();
     Ok(())
 }
@@ -1323,9 +1406,13 @@ fn deliver_native(ctx: &Ctx, text: &str, mode: InputMode, x: &X, owner: Option<O
 fn deliver_tools(ctx: &Ctx, text: &str, mode: InputMode, saved: Option<(ProcessClipboard, String)>) {
     let cls = ctx.xdotool().active_window_class();
     ctx.mark("window_class_read");
+    let ending = ending_for(ctx, ctx.xdotool().active_window_pid());
+    let joined = ending.apply(text);
+    let text = joined.as_str();
     match delivery::select_action(mode, &cls, &ctx.c("DICTATE_TERMINALS", delivery::DEFAULT_TERMINALS)) {
         DeliveryAction::Type => {
             let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+            send_ending(ctx, ending);
         }
         DeliveryAction::Paste { chord } => {
             let (clip, saved_clipboard) = match saved {
@@ -1342,16 +1429,19 @@ fn deliver_tools(ctx: &Ctx, text: &str, mode: InputMode, saved: Option<(ProcessC
             ctx.mark("clipboard_saved");
             if clip.set(text).is_err() {
                 let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+                send_ending(ctx, ending);
                 return;
             }
             ctx.mark("clipboard_set");
             if !delivery::wait_clipboard(|| clip.get(), text, 10) {
                 append_log(&ctx.log, "note: clipboard not ready, typing instead");
                 let _ = ctx.xdotool().type_text(text, &ctx.c("DICTATE_TYPE_DELAY", "4"));
+                send_ending(ctx, ending);
                 return;
             }
             ctx.mark("clipboard_verified");
             let _ = ctx.xdotool().send_paste(chord, &ctx.c("DICTATE_PASTE_KEY_DELAY", "0.012"), ctx.timing_tsv());
+            send_ending(ctx, ending);
             if restore_mode(ctx) && !prev.is_empty() {
                 // Detached re-execution outlives `stop` (bash background
                 // subshell); a thread here would die with the process before
@@ -1415,6 +1505,8 @@ pub fn cmd_retry(ctx: &Ctx, id: Option<&str>) -> Result<()> {
     };
     let text = std::fs::read_to_string(entry.join("transcript.txt"))
         .context("dictate: no saved transcript found; use 'dictate history' and 'dictate show ID'")?;
+    // The file ends in a newline, which a shell would take as Enter.
+    let text = text.trim_end().to_string();
     if text.trim().is_empty() {
         anyhow::bail!("dictate: no saved transcript found; use 'dictate history' and 'dictate show ID'");
     }
@@ -1629,16 +1721,20 @@ pub fn cmd_doctor(ctx: &Ctx) -> i32 {
             }
         }
     }
-    // The example keyd/sxhkd integration uses F19 for a press/release
-    // binding. Informational; start/stop/toggle do not require it.
-    let f19 = std::process::Command::new("xmodmap").args(["-pke"]).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("keycode 197 = F19"))
-        .unwrap_or(false);
-    show(
-        if f19 { Level::Ok } else { Level::Warn },
-        if f19 { "keysym F19 on keycode 197".into() }
-        else { "keycode 197 is not F19 — configure your own press/release binding if needed".into() },
-    );
+    // The example keyd integration sends F19 for a press/release binding;
+    // `dictate hotkey` clears its keysyms while it listens. Informational;
+    // start/stop/toggle do not require it.
+    let line = std::process::Command::new("xmodmap").args(["-pke"]).output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines()
+            .find(|l| l.starts_with("keycode 197 ="))
+            .map(|l| l["keycode 197 =".len()..].trim().to_string()));
+    let (level, msg) = match line.as_deref() {
+        Some("") => (Level::Ok, "keycode 197 has no keysym (`dictate hotkey` is listening)".into()),
+        Some(syms) if syms.starts_with("F19") => (Level::Ok, "keysym F19 on keycode 197".into()),
+        _ => (Level::Warn, "keycode 197 is not F19 — configure your own press/release binding if needed".into()),
+    };
+    show(level, msg);
     // A held key can autorepeat and re-fire the press binding; the pidfile
     // guard survives it, but repeat-off for the key is preferable (bash
     // parses the same xset 256-bit mask, LSB-first within each byte).

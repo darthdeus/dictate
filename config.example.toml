@@ -12,3 +12,8 @@ DICTATE_STREAM = true
 DICTATE_HISTORY = true
 DICTATE_STYLE = false
 DICTATE_LLM = false
+
+# `dictate hotkey` bindings, key=action (keys f13-f24 or X keycodes). Re-read
+# when this file changes. Actions: talk, talk-sentence, cancel, retry,
+# window-prev, window-next, pane-prev, pane-next, key:<xdotool chord>.
+# DICTATE_HOTKEYS = "f19=talk f17=talk f15=talk-sentence f16=cancel f13=retry f20=window-prev f21=window-next f22=pane-next"

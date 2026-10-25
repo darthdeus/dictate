@@ -68,6 +68,16 @@ Codex\" stays as names, not commands), or for a word only
 because it is in the glossary. If unsure, leave it unformatted.
 ";
 
+/// The mid-dictation edit (`Corrector::edit`).
+const EDIT: &str = "\
+You edit dictated text by a spoken instruction. The user dictated <text>, then said <instruction>, \
+an instruction about that text (for example \"no, make that Tuesday\", \"remove the last sentence\", \
+\"turn that into a list\", \"say it more politely\"). Apply the instruction to the text. Change only \
+what it asks for and keep everything else word for word, including wording, punctuation and style. \
+If the instruction is not about the text, return the text unchanged. Both come from speech \
+recognition, so read them by sound where a word looks wrong. Reply with JSON: {\"text\": \"<the edited text>\"}.\
+";
+
 /// The system prompt, with the formatting rule when `format` is set.
 pub fn system_prompt(format: bool) -> String {
     if format {
@@ -159,13 +169,43 @@ impl Corrector {
         Err(err.unwrap_or_else(|| anyhow::anyhow!("no correction endpoint")))
     }
 
+    /// `text` changed as the spoken `instruction` says (the mid-dictation
+    /// edit). Unlike a correction the whole text comes back, and any amount
+    /// of it may change.
+    pub fn edit(&self, text: &str, instruction: &str) -> Result<String> {
+        let system = format!("{EDIT}{}", self.terms);
+        let user = format!("<text>\n{text}\n</text>\n<instruction>\n{instruction}\n</instruction>");
+        let mut err = None;
+        let skipped = self.skipped();
+        for (i, ep) in self.endpoints.iter().enumerate() {
+            if i + 1 < self.endpoints.len() && skipped.contains(&ep.api) {
+                continue;
+            }
+            match self.chat(ep, &system, &user) {
+                Ok(resp) => {
+                    let out = resp.pointer("/choices/0/message/content").and_then(|c| c.as_str())
+                        .context("no content in response")?;
+                    let out: serde_json::Value = serde_json::from_str(out).context("edit reply is not JSON")?;
+                    return out.get("text").and_then(|t| t.as_str()).map(|t| t.trim().to_string())
+                        .context("edit reply has no text");
+                }
+                Err(e) => err = Some(e.context(ep.api.clone())),
+            }
+        }
+        Err(err.unwrap_or_else(|| anyhow::anyhow!("no correction endpoint")))
+    }
+
     fn ask(&self, ep: &Endpoint, text: &str) -> Result<serde_json::Value> {
+        self.chat(ep, &format!("{}{}", self.system, self.terms), &format!("<transcript>\n{text}\n</transcript>"))
+    }
+
+    fn chat(&self, ep: &Endpoint, system: &str, user: &str) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "model": ep.model, "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": format!("{}{}", self.system, self.terms)},
-                {"role": "user", "content": format!("<transcript>\n{text}\n</transcript>")}
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
             ]
         });
         if let (Some(b), Some(extra)) = (body.as_object_mut(), ep.extra.as_object()) {

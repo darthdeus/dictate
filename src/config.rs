@@ -33,6 +33,9 @@ pub fn known_keys() -> HashSet<&'static str> {
         "DICTATE_HISTORY_DAYS",
         "DICTATE_HISTORY_DIR",
         "DICTATE_HISTORY_MAX",
+        "DICTATE_HOTKEYS",
+        "DICTATE_HOTKEYS_LAYER2",
+        "DICTATE_HOTKEYS_TALKING",
         "DICTATE_INPUT",
         "DICTATE_LANG",
         "DICTATE_LLM",
@@ -59,6 +62,8 @@ pub fn known_keys() -> HashSet<&'static str> {
         "DICTATE_OSD_SLIDE_STEP_DELAY",
         "DICTATE_OSD_WIDTH",
         "DICTATE_PARAKEET_MODEL",
+        "DICTATE_JOIN",
+        "DICTATE_PARAGRAPH_APPS",
         "DICTATE_PASTE_ENGINE",
         "DICTATE_PASTE_KEY_DELAY",
         "DICTATE_PASTE_SETTLE",
@@ -125,7 +130,7 @@ impl Env {
 }
 
 /// Effective configuration after defaults < file < env.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     values: HashMap<String, String>,
 }
@@ -220,6 +225,15 @@ pub fn read_config_file(path: &Path) -> Result<Vec<(String, String)>> {
         out.push((key.clone(), s));
     }
     Ok(out)
+}
+
+/// The file `load_from_env` reads, existing or not; `None` when disabled.
+pub fn config_path(env: &Env) -> Option<PathBuf> {
+    match &env.config_override {
+        None => Some(default_config_path(env)),
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(PathBuf::from(s)),
+    }
 }
 
 fn default_config_path(env: &Env) -> PathBuf {
