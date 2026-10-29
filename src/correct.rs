@@ -87,7 +87,8 @@ pub fn system_prompt(format: bool) -> String {
     }
 }
 
-/// One OpenAI-compatible chat endpoint; `extra` is merged into the body.
+/// One OpenAI-compatible chat endpoint; `extra` is merged into the body,
+/// where a `null` removes that key.
 pub struct Endpoint {
     pub api: String,
     pub url: String,
@@ -133,7 +134,10 @@ impl Corrector {
                     model: cfg.get_or("DICTATE_CORRECT_FALLBACK_MODEL", &model),
                     key,
                     // Reasoning off: otherwise ~180 thinking tokens per request.
-                    extra: serde_json::json!({"provider": {"order": order}, "reasoning": {"enabled": false}}),
+                    // No JSON mode: OpenRouter drops every provider without it
+                    // (Cerebras, 2026-10-23), and the prompt asks for JSON anyway.
+                    extra: serde_json::json!({"provider": {"order": order}, "reasoning": {"enabled": false},
+                        "response_format": null}),
                 });
             }
         }
@@ -209,7 +213,13 @@ impl Corrector {
             ]
         });
         if let (Some(b), Some(extra)) = (body.as_object_mut(), ep.extra.as_object()) {
-            b.extend(extra.clone());
+            for (k, v) in extra {
+                if v.is_null() {
+                    b.remove(k);
+                } else {
+                    b.insert(k.clone(), v.clone());
+                }
+            }
         }
         let t = std::time::Instant::now();
         let resp: Result<serde_json::Value> = self.request(ep, body);
@@ -343,6 +353,12 @@ fn key_from_file(name: &str) -> Option<String> {
 /// Applies `{"fixes": [{"from", "to"}]}` to `text`, each to its first
 /// occurrence; a `from` that is not in the text is skipped.
 pub fn apply_fixes(text: &str, answer: &str) -> Result<String> {
+    // Without JSON mode a model may fence its answer.
+    let answer = answer
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```");
     let v: serde_json::Value = serde_json::from_str(answer.trim()).context("answer is not JSON")?;
     let fixes = v.get("fixes").and_then(|f| f.as_array()).context("answer has no fixes list")?;
     let mut out = text.to_string();
@@ -499,5 +515,13 @@ mod tests {
             r#"{"fixes": [{"from": "deep sea,", "to": "DeepSeek,"}, {"from": "nothing", "to": "x"}]}"#).unwrap();
         assert_eq!(out, "we have DeepSeek, muse and deep sea");
         assert!(apply_fixes("a", "not json").is_err());
+        assert_eq!(
+            apply_fixes(
+                "deep sea",
+                "```json\n{\"fixes\": [{\"from\": \"deep sea\", \"to\": \"DeepSeek\"}]}\n```"
+            )
+            .unwrap(),
+            "DeepSeek"
+        );
     }
 }
