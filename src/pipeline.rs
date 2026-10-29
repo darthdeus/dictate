@@ -1956,9 +1956,18 @@ pub fn cmd_meter(ctx: &Ctx) -> Result<()> {
         if got < frame {
             break;
         }
-        let samples: Vec<i16> = buf[..got].chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-        let chan: Vec<i16> = samples.iter().skip(ch).step_by(nch.max(1)).copied().collect();
+        let samples: Vec<i16> = buf[..got]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let chan: Vec<i16> = samples
+            .iter()
+            .skip(ch)
+            .step_by(nch.max(1))
+            .copied()
+            .collect();
         if chan.is_empty() {
             continue;
         }
@@ -2364,7 +2373,11 @@ fn read_range(path: &Path, start: u64, end: u64) -> Vec<u8> {
 }
 
 fn bytes_to_i16(data: &[u8]) -> Vec<i16> {
-    data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
+    data.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
+        .collect()
 }
 
 // Test seam for pactl parsing (same scan as `pactl_source_channels`).

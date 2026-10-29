@@ -445,14 +445,13 @@ impl Editor {
                 String::new()
             });
             let text = crate::segment::join(previous.as_deref().unwrap_or(""), &spoken);
-            let edited = recognize(&instruction, None)
-                .and_then(|said| {
-                    append_log(&log, &format!("dictate daemon: edit instruction: {said}"));
-                    if said.trim().is_empty() || text.trim().is_empty() {
-                        return Ok(text.clone());
-                    }
-                    corrector.map_err(anyhow::Error::from)?.edit(&text, &said)
-                });
+            let edited = recognize(&instruction, None).and_then(|said| {
+                append_log(&log, &format!("dictate daemon: edit instruction: {said}"));
+                if said.trim().is_empty() || text.trim().is_empty() {
+                    return Ok(text.clone());
+                }
+                corrector?.edit(&text, &said)
+            });
             edited.unwrap_or_else(|e| {
                 append_log(&log, &format!("dictate daemon: edit failed, keeping the text: {e:#}"));
                 text

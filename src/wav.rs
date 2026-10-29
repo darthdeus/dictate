@@ -67,7 +67,12 @@ pub fn read_mono16(path: &Path) -> Result<Vec<i16>> {
             if !fmt_ok {
                 bail!("data before fmt chunk");
             }
-            return Ok(b[body].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect());
+            return Ok(b[body]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| i16::from_le_bytes(*c))
+                .collect());
         }
         i = i.saturating_add(8 + len + (len & 1));
     }
@@ -107,8 +112,15 @@ pub fn peak_db(samples: &[i16]) -> f32 {
 /// levels in dBFS, so pauses don't pull it down and one shout doesn't push
 /// it up. About -20 at a good gain, -32 when it is turned too low.
 pub fn speech_db(samples: &[i16]) -> f32 {
-    let mut levels: Vec<f32> = samples.chunks_exact(RATE as usize / 10)
-        .map(|b| 10.0 * (energy(b) as f32 / b.len() as f32 / (32768.0 * 32768.0)).max(1e-10).log10())
+    let mut levels: Vec<f32> = samples
+        .as_chunks::<{ RATE as usize / 10 }>()
+        .0
+        .iter()
+        .map(|b| {
+            10.0 * (energy(b) as f32 / b.len() as f32 / (32768.0 * 32768.0))
+                .max(1e-10)
+                .log10()
+        })
         .collect();
     if levels.is_empty() {
         return -100.0;

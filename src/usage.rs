@@ -161,7 +161,7 @@ pub fn summarize_keys(state_dir: &Path, days: f64) -> Result<String> {
         *e.1.entry(if k.pane.is_empty() { k.app.clone() } else { k.pane.clone() }).or_default() += 1;
     }
     let mut actions: Vec<_> = by.iter().map(|(a, (key, apps))| (apps.values().sum::<usize>(), a, key, apps)).collect();
-    actions.sort_by(|a, b| b.0.cmp(&a.0));
+    actions.sort_by_key(|a| std::cmp::Reverse(a.0));
     out += "action                       key     count  where\n";
     for (n, action, key, apps) in &actions {
         let mut apps: Vec<_> = apps.iter().collect();
@@ -181,7 +181,7 @@ pub fn summarize_keys(state_dir: &Path, days: f64) -> Result<String> {
         }
     }
     let mut pairs: Vec<_> = pairs.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    pairs.sort_by_key(|a| std::cmp::Reverse(a.1));
     if !pairs.is_empty() {
         out += "\nthen within 30 s\n";
         for ((a, b), n) in pairs.iter().take(10) {
