@@ -2,7 +2,7 @@
 #! nix-shell -i python3 -p "python3.withPackages (ps: [ ps.requests ps.websockets ])"
 """dictbench — compare speech-to-text providers on your own read-aloud clips.
 
-  dictbench record [--only N,M]   read sentences.txt (else sentences.example.txt, or $DICTBENCH_SENTENCES) aloud, one clip each
+  dictbench record [--only N,M | --next N] [--session S]   read sentences.txt (else sentences.example.txt, or $DICTBENCH_SENTENCES) aloud, one clip each
   dictbench run [SESSION] [-p a,b] transcribe the latest (or named) session
   dictbench providers              list providers and whether a key was found
 
@@ -572,15 +572,24 @@ def term_hits(ref, hyp):
 def record(args):
     mic = CFG.get("DICTATE_MIC") or "@DEFAULT_SOURCE@"
     channels, chan = int(CFG.get("DICTATE_CHANNELS", 1)), int(CFG.get("DICTATE_CHAN", 0))
-    sentences = [l.strip() for l in Path(os.environ.get("DICTBENCH_SENTENCES", HERE / "sentences.txt" if (HERE / "sentences.txt").exists() else HERE / "sentences.example.txt")).read_text().splitlines()
-                 if l.strip() and not l.startswith("#")]
-    only = {int(n) for n in args.only.split(",")} if args.only else None
-    session = Path(args.session) if args.session else STATE / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    session = (Path(args.session) if "/" in args.session else STATE / args.session) if args.session \
+        else STATE / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     session.mkdir(parents=True, exist_ok=True)
+    # A session keeps its own copy of the sentence list, so later batches
+    # (--next) need no DICTBENCH_SENTENCES and keep the same numbering.
+    saved = session / "sentences.txt"
+    if not saved.exists():
+        saved.write_text(Path(os.environ.get("DICTBENCH_SENTENCES", HERE / "sentences.txt" if (HERE / "sentences.txt").exists() else HERE / "sentences.example.txt")).read_text())
+    sentences = [l.strip() for l in saved.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    only = {int(n) for n in args.only.split(",")} if args.only else None
+    if args.next:
+        only = set([n for n in range(1, len(sentences) + 1) if not (session / f"{n:02d}.wav").exists()][:args.next])
+    done = lambda: sum((session / f"{n:02d}.wav").exists() for n in range(1, len(sentences) + 1))
     print(f"Session: {session}\nMic: {mic} (channel {chan} of {channels})\n"
+          f"Recorded so far: {done()}/{len(sentences)}\n"
           "Enter starts, Enter stops. 's' skips, 'q' quits.\n")
     for n, text in enumerate(sentences, 1):
-        if only and n not in only:
+        if only is not None and n not in only:
             continue
         print(f"[{n}/{len(sentences)}] {text}")
         answer = input("  ready? ").strip().lower()
@@ -601,7 +610,8 @@ def record(args):
                        check=True)
         raw.unlink()
         (session / f"{n:02d}.txt").write_text(text + "\n")
-    print(f"\nDone. Next: dictbench run {session.name}")
+    print(f"\nRecorded {done()}/{len(sentences)}. Next batch: dictbench record --session {session.name} --next 10"
+          f"\nScore: dictbench run {session.name}")
 
 # ------------------------------------------------------------------ run
 
@@ -708,6 +718,7 @@ def main():
     r = sub.add_parser("record")
     r.add_argument("--only", help="comma-separated sentence numbers to (re)record")
     r.add_argument("--session", help="existing session dir to add takes to")
+    r.add_argument("--next", type=int, metavar="N", help="record the next N sentences not yet recorded in --session")
     u = sub.add_parser("run")
     u.add_argument("session", nargs="?")
     u.add_argument("-p", "--providers", help=f"comma-separated subset of: {','.join(PROVIDERS)}")
