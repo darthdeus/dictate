@@ -116,12 +116,29 @@ Gtk.main()
         wait_for(lambda: not xd("search", "--onlyvisible", "--class", "dictate-osd"), timeout=3)
         assert not (tmp/"clicked").exists(), "Click on the card reached the window below"
         assert xd("getwindowfocus") == wid, "Dismissing the card changed focus"
+        # Capture receipts must show the result even when there is no diff.
+        for receipt in (
+            "1 word correction\ncalling → culling\n\nCaptured draft:\nPlease ask the worker to fix the culling bug before we run the next test.",
+            "No changes found in the matched dictation.\n\nCaptured draft:\nokay, so this is an example dictation where we try to learn from the edit",
+        ):
+            update("captured", receipt, label="Draft captured", engine="Saved locally · click to dismiss")
+            wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd"))
+            time.sleep(0.3)
+            geometry = dict(line.split("=", 1) for line in xd("getwindowgeometry", "--shell", hud).splitlines())
+            assert int(geometry["WIDTH"]) == 480 and 180 < int(geometry["HEIGHT"]) <= 450, geometry
+            assert xd("getwindowfocus") == wid, "Capture receipt stole focus"
+            if os.getenv("DICTATE_CHECK_CAPTURE_IMAGE"):
+                subprocess.run(["magick", "import", "-display", display, "-window", hud,
+                                os.environ["DICTATE_CHECK_CAPTURE_IMAGE"]], env=env, check=True)
         update("processing", "Next one")
         assert len(wait_for(lambda: xd("search", "--onlyvisible", "--class", "dictate-osd")).split()) == 1
 
         spec = importlib.util.spec_from_file_location("overlay", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        receipt = dict(phase="captured", text="No changes found in the matched dictation.\nCaptured draft:\n日本語")
+        assert module.compact(receipt)
+        assert module.card_text(receipt) == (receipt["text"], []), "Capture text was hidden as an empty diff"
         def changed(previous, current):
             encoded = current.encode("utf-8")
             return [encoded[a:b].decode("utf-8") for a, b in module.changed_words(previous, current)]
@@ -168,7 +185,7 @@ Gtk.main()
         model.levels = [0.0]*36
         module.Overlay.sample_audio(model)
         assert model.levels[-1] == 0, "Meter read the wrong channel"
-        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges; correction diff in the card; click dismisses the card")
+        print("PASS: focus on map/update/remap; clicks reach underlying window; reuse; expiry; malformed state; audio channel and decay; transcript continuity; changed-word UTF-8 ranges; correction diff in the card; visible capture receipts; click dismisses the card")
     finally:
         for process in reversed(processes):
             process.terminate()

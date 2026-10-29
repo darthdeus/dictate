@@ -18,6 +18,7 @@
 //! spaces. Keys are f13-f24 or X keycodes; actions:
 //!   talk, talk-sentence  hold to talk; then a new paragraph / sentence
 //!   cancel, retry      discard the recording / re-paste the last dictation
+//!   learn              capture corrections from the current CLI draft
 //!   window-prev, window-next  previous / next window of the focused tmux
 //!   pane-prev, pane-next      previous / next pane in that window
 //!   key:<chord>        send a chord with xdotool, e.g. key:alt+BackSpace
@@ -84,6 +85,7 @@ impl Action {
             Action::Talk { sentence: false } => "talk ¶".into(),
             Action::Talk { sentence: true } => "talk .".into(),
             Action::Run("retry") => "re-paste".into(),
+            Action::Run("learn") => "✓ learn".into(),
             Action::Nav(Nav::Window(s)) => if *s > 0 { "window →" } else { "← window" }.into(),
             Action::Nav(Nav::Pane(s)) => if *s > 0 { "pane →" } else { "← pane" }.into(),
             Action::Key(chord) => match chord.as_str() {
@@ -113,7 +115,7 @@ fn key_name(code: u32) -> String {
 /// Caps Lock (keyd sends F19) and the action keys a macro pad maps onto.
 const DEFAULT_BINDINGS: &str =
     "f19=talk f17=talk f15=talk-sentence f16=cancel f13=layer f20=window-prev f21=window-next f22=pane-next";
-const DEFAULT_LAYER2: &str = "f18=retry";
+const DEFAULT_LAYER2: &str = "f14=learn f18=retry";
 /// While a talk key is held: chords with it.
 const DEFAULT_TALKING: &str = "f18=edit";
 
@@ -145,6 +147,7 @@ fn parse_bindings(s: &str) -> Result<Vec<(u8, Action)>> {
                 "talk-sentence" | "talk-space" => Action::Talk { sentence: true },
                 "cancel" => Action::Run("cancel"),
                 "retry" => Action::Run("retry"),
+                "learn" => Action::Run("learn"),
                 "window-prev" => Action::Nav(Nav::Window(-1)),
                 "window-next" => Action::Nav(Nav::Window(1)),
                 "pane-prev" => Action::Nav(Nav::Pane(-1)),
@@ -460,6 +463,9 @@ mod tests {
         assert!(keys.contains(&(193, Action::Talk { sentence: true })));
         assert!(keys.contains(&(199, Action::Nav(Nav::Window(1)))));
         assert!(keys.contains(&(200, Action::Nav(Nav::Pane(1)))));
+        assert!(parse_bindings(DEFAULT_LAYER2)
+            .unwrap()
+            .contains(&(192, Action::Run("learn"))));
     }
 
     #[test]

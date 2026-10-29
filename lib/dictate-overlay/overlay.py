@@ -91,7 +91,7 @@ def next_state(previous, incoming):
 def compact(state):
     """Finished and failed dictations show as a small card at the top right
     that a click dismisses."""
-    return state.get("phase") in ("success", "error")
+    return state.get("phase") in ("success", "captured", "error")
 
 
 COMPACT_W = 480
@@ -487,7 +487,8 @@ class Overlay(Gtk.Window):
         now = time.monotonic()
         phase = self.state.get("phase", "recording")
         accent = {"recording": (0.40, 0.88, 0.73), "processing": (0.65, 0.64, 1.0),
-                  "success": (0.40, 0.88, 0.73), "error": (1.0, 0.63, 0.46)}[phase]
+                  "success": (0.40, 0.88, 0.73), "captured": (0.40, 0.88, 0.73),
+                  "error": (1.0, 0.63, 0.46)}[phase]
         if compact(self.state):
             self.draw_card(cr, accent)
             return False

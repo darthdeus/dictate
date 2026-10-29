@@ -233,6 +233,7 @@ pub fn notify(ctx: &Ctx, title: &str, body: &str, timeout_ms: u64) {
         raw: String::new(),
         engine: match phase {
             crate::overlay::Phase::Recording => "Rust \u{b7} live: whisper snapshots".to_string(),
+            crate::overlay::Phase::Captured => "Saved locally · click to dismiss".to_string(),
             _ => ctx.final_label(),
         },
         audio: ctx.paths.raw.display().to_string(),
@@ -710,6 +711,7 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
     } else {
         transcribe_to_text(ctx, &ctx.paths.wav, entry.as_deref(), &mode, early)
     };
+    let audio_aligned = base.is_none();
     let outcome = match (outcome, base) {
         (Ok(TextOutcome::Ready { raw, text }), Some(b)) => Ok(TextOutcome::Ready {
             raw: crate::segment::join(&b, &raw), text: crate::segment::join(&b, &text) }),
@@ -748,10 +750,12 @@ fn finish_stop(ctx: &Ctx, early: Option<EarlyPass>) -> Result<()> {
         }
         notify_done(ctx, "Copied to clipboard", &raw, &text, entry.as_deref(), dur);
     } else {
+        let destination = crate::learn::focused_target().ok();
         deliver_with(ctx, &text, prefetch);
         ctx.mark("delivery_returned");
         if let Some(e) = &entry {
             ctx.history.set_status(e, "delivery-attempted");
+            record_learning_delivery(ctx, e, &text, destination, audio_aligned);
         }
         notify_done(ctx, "Pasted", &raw, &text, entry.as_deref(), dur);
     }
@@ -1401,6 +1405,32 @@ fn ending_for(ctx: &Ctx, window_pid: Option<u32>) -> Ending {
     target::plan(command.as_deref(), ctx.join.get(), &ctx.c("DICTATE_PARAGRAPH_APPS", "claude|codex"))
 }
 
+fn record_learning_delivery(
+    ctx: &Ctx,
+    entry: &Path,
+    text: &str,
+    destination: Option<target::DraftTarget>,
+    audio_aligned: bool,
+) {
+    let Some(destination) =
+        destination.filter(|t| crate::learn::focused_target().ok().as_ref() == Some(t))
+    else {
+        return;
+    };
+    let delivered = match ending_for(ctx, Some(destination.window_pid)) {
+        Ending::Paragraph => format!("{text}\n\n"),
+        ending => ending.apply(text),
+    };
+    if let Err(err) =
+        crate::learn::record_delivery(ctx, entry, &delivered, destination, audio_aligned)
+    {
+        append_log(
+            &ctx.log,
+            &format!("note: correction provenance unavailable: {err:#}"),
+        );
+    }
+}
+
 /// The keys an ending sends after the text (`Ending::apply` adds the rest).
 fn send_ending(ctx: &Ctx, ending: Ending) {
     if ending == Ending::Paragraph {
@@ -1563,7 +1593,9 @@ pub fn cmd_retry(ctx: &Ctx, id: Option<&str>) -> Result<()> {
         notify(ctx, "\u{1f4cb} recovered dictation", &text,
             ctx.c("DICTATE_OSD_DONE_MS", "1000").parse().unwrap_or(1000));
     } else {
+        let destination = crate::learn::focused_target().ok();
         deliver(ctx, &text);
+        record_learning_delivery(ctx, &entry, &text, destination, true);
     }
     println!("retried {}", entry.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
     Ok(())

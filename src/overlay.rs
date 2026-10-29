@@ -16,6 +16,7 @@ pub enum Phase {
     Recording,
     Processing,
     Success,
+    Captured,
     Error,
 }
 
@@ -115,6 +116,9 @@ pub fn map_notify(title: &str, body: &str) -> (Phase, String, String) {
     }
     if let Some(rest) = title.strip_prefix("dictate:") {
         return (Phase::Error, rest.trim_start().to_string(), body.to_string());
+    }
+    if let Some(rest) = title.strip_prefix("✓ ") {
+        return (Phase::Captured, rest.to_string(), body.to_string());
     }
     if let Some(rest) = title.strip_prefix("\u{1f4cb} ") {
         return (Phase::Success, "Copied to clipboard".into(), rest.to_string());
@@ -269,6 +273,11 @@ mod tests {
         assert_eq!((p, l.as_str(), t.as_str()), (Phase::Success, "Copied to clipboard", "hello"));
         let (p, l, t) = map_notify("final text", "");
         assert_eq!((p, l.as_str(), t.as_str()), (Phase::Success, "Ready", "final text"));
+        let (p, l, t) = map_notify("✓ Draft captured", "calling → culling");
+        assert_eq!(
+            (p, l.as_str(), t.as_str()),
+            (Phase::Captured, "Draft captured", "calling → culling")
+        );
         let (_, _, t) = map_notify("final text", "extra body");
         assert_eq!(t, "final text\nextra body");
     }

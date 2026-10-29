@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# $EDITOR/$VISUAL wrapper for `dictate learn`. Codex and Claude Code open the
+# editor on Ctrl+G with the draft in a file; while a capture is pending for this
+# tmux pane, `dictate learn-editor` reads that file instead and no editor opens.
+# Otherwise (or on exit 3) it runs the real editor, $DICTATE_EDITOR (default vi).
+stateDir="${XDG_STATE_HOME:-$HOME/.local/state}/dictate"
+tmux_pane="${TMUX_PANE:-}"
+
+if [[ "$tmux_pane" =~ ^%[0-9]+$ ]] &&
+  [[ -f "$stateDir/learn/pending/pane-${tmux_pane#%}.json" ]]; then
+  "${DICTATE_LEARN_BIN:-dictate}" learn-editor -- "$@"
+  dictate_status=$?
+
+  case "$dictate_status" in
+    0) exit 0 ;;
+    3) ;;
+    *) exit "$dictate_status" ;;
+  esac
+fi
+
+read -ra editor <<<"${DICTATE_EDITOR:-vi}"
+exec "${editor[@]}" "$@"

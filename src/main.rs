@@ -88,6 +88,25 @@ enum Command {
         /// Entry id or prefix (default: latest with transcript)
         id: Option<String>,
     },
+    /// Capture corrections from the focused Codex/Claude draft before sending it
+    Learn,
+    /// List saved edited-draft captures
+    Corrections {
+        #[arg(default_value = "20")]
+        n: usize,
+    },
+    /// Inspect a capture; explicitly approve an aligned entry as a gold transcript
+    Correction {
+        id: String,
+        #[arg(long, value_name = "HISTORY_ID")]
+        approve: Option<String>,
+    },
+    /// Hidden: editor-wrapper handoff (exit 3 means open the normal editor)
+    #[command(hide = true)]
+    LearnEditor {
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Re-transcribe saved dictations and compare with their saved transcripts
     Replay {
         #[arg(default_value = "20")]
@@ -152,6 +171,17 @@ fn main() -> anyhow::Result<()> {
     dictate_lib::paths::set_private_umask();
     let cli = Cli::parse();
     match cli.command {
+        Command::Learn => return dictate_lib::learn::command(&ctx()?),
+        Command::Corrections { n } => print!("{}", dictate_lib::learn::list(&ctx()?, n)?),
+        Command::Correction { id, approve } => print!(
+            "{}",
+            dictate_lib::learn::show(&ctx()?, &id, approve.as_deref())?
+        ),
+        Command::LearnEditor { args } => {
+            if !dictate_lib::learn::editor_capture(&ctx()?, &args)? {
+                std::process::exit(3);
+            }
+        }
         Command::PreviewWorker => return pipeline::run_preview_worker(&ctx()?),
         Command::Shadow { entry } => return pipeline::run_shadow(&ctx()?, &entry),
         Command::RestoreClipboard { backend, settle_secs, expected_path, prev_path, xclip_bin, copyq_bin } => {

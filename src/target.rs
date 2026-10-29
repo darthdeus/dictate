@@ -79,6 +79,102 @@ pub fn tmux_command(window_pid: u32) -> Option<String> {
     client_fields(window_pid, "#{pane_current_command}")?.into_iter().next()
 }
 
+/// A concrete CLI instance, not just a reused pane name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DraftTarget {
+    pub window_pid: u32,
+    pub pane: String,
+    pub pane_pid: u32,
+    pub app: String,
+    pub app_pid: u32,
+    pub app_started: String,
+    #[serde(default)]
+    pub tty: String,
+}
+
+pub fn process_started(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .to_string(),
+    )
+}
+
+/// Resolve the Codex/Claude composer under one focused terminal window.
+pub fn draft_target(window_pid: u32) -> Option<DraftTarget> {
+    let fields = client_fields(
+        window_pid,
+        "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_tty}",
+    )?;
+    let [pane, pane_pid, app, tty] = fields.as_slice() else {
+        return None;
+    };
+    if !matches!(app.as_str(), "codex" | "claude") {
+        return None;
+    }
+    let pane_pid = pane_pid.parse().ok()?;
+    let app_pid = std::iter::once(pane_pid)
+        .chain(descendants(pane_pid))
+        .find(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/comm")).is_ok_and(|name| name.trim() == app)
+        })?;
+    Some(DraftTarget {
+        window_pid,
+        pane: pane.clone(),
+        pane_pid,
+        app: app.clone(),
+        app_pid,
+        app_started: process_started(app_pid)?,
+        tty: tty.clone(),
+    })
+}
+
+/// Editor handoffs may pass through a shell, but not an agent's tool subprocess.
+pub fn editor_from_target(target: &DraftTarget) -> bool {
+    if process_started(target.app_pid).as_deref() != Some(&target.app_started) {
+        return false;
+    }
+    // Shell tools use pipes or their own PTY, not the CLI composer's TTY.
+    if target.tty.is_empty()
+        || std::fs::read_link("/proc/self/fd/0").ok().as_deref()
+            != Some(std::path::Path::new(&target.tty))
+        || std::fs::read_link(format!("/proc/{}/fd/0", target.app_pid))
+            .ok()
+            .as_deref()
+            != Some(std::path::Path::new(&target.tty))
+    {
+        return false;
+    }
+    let mut pid = std::process::id();
+    for _ in 0..8 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let Some(parent) = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        if parent == target.app_pid {
+            return true;
+        }
+        let name = std::fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
+        if !matches!(name.trim(), "bash" | "sh" | "zsh" | "v" | "env") {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nav {
     /// Next (+1) or previous (-1) window of the session, wrapping.

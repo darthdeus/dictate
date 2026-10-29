@@ -110,6 +110,8 @@ dictate hotkey      # X11 push-to-talk on F19 without a key grab
 dictate demo        # show the overlay without recording
 dictate history     # list recoverable dictations
 dictate retry latest
+dictate learn       # save corrections from the focused CLI draft, before sending
+dictate corrections # list saved captures
 dictate replay 50   # re-run saved recordings through the text path, read-only
 ```
 
@@ -126,7 +128,7 @@ key's keysyms so apps ignore it, and runs `start`/`stop` on press/release.
 Run it as part of the X session, e.g. a systemd user service. Shift held on
 the key runs `stop --sentence` (see below). `DICTATE_HOTKEYS` binds more keys,
 e.g. a macro pad mapped onto F13-F24 with keyd: `talk`, `talk-sentence`,
-`cancel` (discard the recording in progress), `retry` (re-paste the last
+`cancel` (discard the recording in progress), `learn` (capture draft corrections), `retry` (re-paste the last
 dictation), `window-prev`/`window-next` and `pane-prev`/`pane-next` (move in
 the focused terminal's tmux) and `key:<chord>` (send a chord, e.g. `key:alt+BackSpace`). The
 listener re-reads the config file when it changes, so no restart is needed.
@@ -145,6 +147,55 @@ in the focused tmux pane) it sends Ctrl+J twice, a new paragraph; elsewhere a
 space (never Ctrl+J: in a shell that is Enter). `stop --sentence` ends the
 sentence instead: `. `, or a space after the text's own `.`, `?` or `!`.
 `DICTATE_JOIN=off` pastes the text alone.
+
+### Capture corrections you already made
+
+For Codex CLI and Claude Code in tmux: dictate, edit the pasted text in the
+composer, then invoke `dictate learn` from a hotkey **before sending**. The macro
+pad's default layer-two binding is `f14=learn`; `f18` remains re-paste. This is a
+local draft capture, with no transcription or correction API request.
+
+A **Draft captured** card stays visible for ten seconds (click to dismiss). It
+shows word replacements such as `calling → culling`, formatting/review counts,
+and a short preview of the saved draft. An unchanged draft explicitly says
+**No changes found**; a failed capture shows an error instead.
+
+The capture reads the draft through the CLIs' Ctrl+G external editor, so set
+`EDITOR`/`VISUAL` to `bin/dictate-editor` and your real editor in
+`DICTATE_EDITOR` (default `vi`). While a capture is pending the wrapper hands the
+draft file to `dictate learn-editor -- "$@"` instead of opening an editor: exit 0
+means captured, exit 3 means ordinary editing (it opens the real editor), other
+statuses mean capture failed. Your own wrapper can follow the same contract. A pending
+request is limited to its tmux pane, CLI process instance and composer TTY;
+normal editing and shell-tool subprocesses cannot consume another draft's capture.
+An installation without the wrapper reports a capture timeout.
+
+Each successful paste/re-paste records its exact delivered text, history id,
+raw/corrected stages and destination. The capture considers the latest 20 deliveries
+in the same CLI instance within 30 minutes. It reads the app's actual editor file,
+including expanded pasted text, and leaves its contents unchanged. It does not
+scrape terminal scrollback, change the clipboard, or send the prompt.
+
+Private state is under `${XDG_STATE_HOME:-$HOME/.local/state}/dictate/learn/`:
+`deliveries/` stores provenance; `captures/<id>/` stores `editor.raw.txt`, `draft.txt`
+and `capture.json` with matched spans and word changes. Multiple dictations are
+matched separately using unchanged text anchors. Formatting-only changes are
+separate from localized word replacements; rewrites, short/weak matches, merged
+spans, repeated text and unrelated drafts remain review candidates.
+
+Capturing never silently creates a training label. Inspect with
+`dictate correction CAPTURE_ID`; after checking that a matched span represents
+what was spoken, `dictate correction CAPTURE_ID --approve HISTORY_ID` writes
+`transcript.gold.txt` and its provenance for that recording. Approval requires
+one unambiguous match, preserves any existing different gold label, and rejects
+spoken-edit recordings whose saved audio covers only the post-edit tail. No
+recognizer is retrained or switched automatically. The existing fine-tuning
+collectors already prefer gold labels; keep their evaluation split fixed.
+
+The isolated checks are `python3 bench/check-learn-editor.py` for the editor
+wrapper and `python3 bench/check-learn-cli.py` for real installed Codex/Claude
+drafts in a private Xvfb/tmux session. The latter submits no messages and uses
+separate dictation/clipboard/runtime state.
 
 With `dictate daemon` running, the live preview comes from the Nemotron
 streaming model (transcribe.cpp, `DICTATE_STREAM_MODEL`), and the final pass
