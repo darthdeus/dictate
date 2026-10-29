@@ -16,6 +16,7 @@ pub mod doctor;
 pub mod elevenlabs;
 pub mod history;
 pub mod hotkey;
+pub mod learn_match;
 pub mod overlay;
 pub mod paths;
 pub mod pipeline;
