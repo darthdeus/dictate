@@ -97,6 +97,13 @@ pub struct Endpoint {
     pub extra: serde_json::Value,
 }
 
+/// A correction and who made it, for the card.
+pub struct Corrected {
+    pub text: String,
+    /// The endpoint that answered: `groq`, or OpenRouter's provider (`cerebras`).
+    pub via: String,
+}
+
 pub struct Corrector {
     /// Tried in order until one answers.
     pub endpoints: Vec<Endpoint>,
@@ -158,6 +165,11 @@ impl Corrector {
     /// A failed request moves on to the next endpoint; an answer rejected by
     /// the change guard does not (the same model would answer the same).
     pub fn correct(&self, text: &str) -> Result<String> {
+        self.correct_via(text).map(|c| c.text)
+    }
+
+    /// [`Self::correct`], also naming the endpoint that answered.
+    pub fn correct_via(&self, text: &str) -> Result<Corrected> {
         let mut err = None;
         let skipped = self.skipped();
         for (i, ep) in self.endpoints.iter().enumerate() {
@@ -166,8 +178,15 @@ impl Corrector {
                 continue;
             }
             match self.ask(ep, text) {
-                Ok(resp) => return self.finish(text, resp),
-                Err(e) => err = Some(e.context(format!("{}", ep.api))),
+                Ok(resp) => {
+                    // OpenRouter says which of its providers served the request.
+                    let via = match resp.get("provider").and_then(|p| p.as_str()) {
+                        Some(p) => p.to_lowercase(),
+                        None => ep.api.clone(),
+                    };
+                    return self.finish(text, resp).map(|text| Corrected { text, via });
+                }
+                Err(e) => err = Some(e.context(ep.api.clone())),
             }
         }
         Err(err.unwrap_or_else(|| anyhow::anyhow!("no correction endpoint")))

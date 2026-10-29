@@ -322,6 +322,51 @@ pub fn local_iso_now() -> String {
         .unwrap_or_else(|| format!("{}+00:00", chrono_iso_utc()))
 }
 
+/// Fine-tuning data so far, in seconds: (all history audio, the part with a
+/// trusted label). Labelled = an ElevenLabs shadow or gold transcript, plus
+/// read-aloud bench clips (`<bench>/<date session>/NN.wav` next to NN.txt).
+/// Durations come from file sizes (16 kHz mono s16), so no audio is read.
+pub fn training_audio(history: &Path, bench: &Path) -> (f64, f64) {
+    let secs =
+        |wav: &Path| fs::metadata(wav).map_or(0.0, |m| m.len().saturating_sub(44) as f64 / 32000.0);
+    let dirs = |d: &Path| {
+        fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+    };
+    let (mut total, mut labelled) = (0.0, 0.0);
+    for entry in dirs(history).filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_entry_name)
+    }) {
+        let s = secs(&entry.join("audio.wav"));
+        total += s;
+        if entry.join("transcript.elevenlabs.raw.txt").exists()
+            || entry.join("transcript.gold.txt").exists()
+        {
+            labelled += s;
+        }
+    }
+    // Only date-named sessions: lastmsg/, shadow35/ etc. are copies of history clips.
+    for session in dirs(bench).filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("20"))
+    }) {
+        for wav in dirs(&session).filter(|p| {
+            p.extension().is_some_and(|e| e == "wav") && p.with_extension("txt").exists()
+        }) {
+            let s = secs(&wav);
+            total += s;
+            labelled += s;
+        }
+    }
+    (total, labelled)
+}
+
 /// `ffprobe` duration of an archived clip, or `unknown` (bash default when
 /// `ffprobe` yields nothing).
 fn wav_duration(wav: &Path) -> String {
@@ -418,6 +463,31 @@ mod tests {
         fs::write(dir.join("2026-09-10_11-00-00-2/transcript.txt"), "world\n").unwrap();
         let s = HistoryStore { dir: dir.clone(), enabled: true, max_days: 30, max_entries: 200 };
         (tmp, s)
+    }
+
+    #[test]
+    fn training_audio_counts_labelled_history_and_bench() {
+        let (t, s) = store();
+        let wav =
+            |p: &Path, secs: u64| fs::write(p, vec![0u8; 44 + 32000 * secs as usize]).unwrap();
+        wav(&s.dir.join("2026-09-10_10-00-00-1/audio.wav"), 2);
+        wav(&s.dir.join("2026-09-10_11-00-00-2/audio.wav"), 3);
+        fs::write(
+            s.dir
+                .join("2026-09-10_11-00-00-2/transcript.elevenlabs.raw.txt"),
+            "x\n",
+        )
+        .unwrap();
+        let bench = t.path().join("bench");
+        for d in ["2026-10-22_readaloud2", "lastmsg"] {
+            fs::create_dir_all(bench.join(d)).unwrap();
+            wav(&bench.join(d).join("01.wav"), 5);
+            fs::write(bench.join(d).join("01.txt"), "ref\n").unwrap();
+        }
+        wav(&bench.join("2026-10-22_readaloud2/02.wav"), 7); // no reference yet
+        let (total, labelled) = training_audio(&s.dir, &bench);
+        assert!((total - 10.0).abs() < 1e-9, "{total}");
+        assert!((labelled - 8.0).abs() < 1e-9, "{labelled}");
     }
 
     #[test]

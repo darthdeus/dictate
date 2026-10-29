@@ -613,28 +613,58 @@ impl EarlyWorker {
                 let segment = pass.recognize(&samples, Some(context)).ok()?;
                 let raw = crate::segment::join(&prev.raw, &segment);
                 let clean = crate::text::clean_whisper_text(&raw);
-                let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
-                    None
-                } else {
-                    pass.correct(&clean).and_then(Result::ok)
+                let (corrected, corrected_by) =
+                    if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
+                        (None, None)
+                    } else {
+                        pass.correct(&clean)
+                            .and_then(Result::ok)
+                            .map_or((None, None), |c| (Some(c.text), Some(c.via)))
+                    };
+                let shown = corrected.clone().unwrap_or_else(|| {
+                    crate::segment::join(&shown, &crate::text::clean_whisper_text(&segment))
+                });
+                let pass = EarlyPass {
+                    raw,
+                    clean,
+                    corrected,
+                    corrected_by,
+                    until: Some(len),
+                    segments: prev.segments + 1,
                 };
-                let shown = corrected.clone()
-                    .unwrap_or_else(|| crate::segment::join(&shown, &crate::text::clean_whisper_text(&segment)));
-                let pass = EarlyPass { raw, clean, corrected, until: Some(len), segments: prev.segments + 1 };
-                Some(Done { len, words, pass, shown })
+                Some(Done {
+                    len,
+                    words,
+                    pass,
+                    shown,
+                })
             })
         } else {
             let samples = audio.to_vec();
             std::thread::spawn(move || {
                 let raw = pass.whisper(&samples).ok()?;
                 let clean = crate::text::clean_whisper_text(&raw);
-                let corrected = if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
-                    None
-                } else {
-                    pass.correct(&clean).and_then(Result::ok)
-                };
+                let (corrected, corrected_by) =
+                    if clean.is_empty() || speech.load(Ordering::SeqCst) > len {
+                        (None, None)
+                    } else {
+                        pass.correct(&clean)
+                            .and_then(Result::ok)
+                            .map_or((None, None), |c| (Some(c.text), Some(c.via)))
+                    };
                 let shown = corrected.clone().unwrap_or_else(|| clean.clone());
-                Some(Done { len, words, pass: EarlyPass { raw, clean, corrected, ..Default::default() }, shown })
+                Some(Done {
+                    len,
+                    words,
+                    pass: EarlyPass {
+                        raw,
+                        clean,
+                        corrected,
+                        corrected_by,
+                        ..Default::default()
+                    },
+                    shown,
+                })
             })
         };
         let keep = !self.incremental || speech_end - self.cut() >= self.min_segment;

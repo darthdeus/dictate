@@ -97,6 +97,16 @@ pub fn audio_minutes(state_dir: &Path, purpose: &str) -> f64 {
         .map(|c| c.audio_secs).sum::<f64>() / 60.0
 }
 
+/// Dollars spent on a dictation's own requests (pause passes and the final
+/// pass, not the shadow label made after it) since `since`.
+pub fn dictation_usd(state_dir: &Path, since: f64) -> f64 {
+    read(&state_dir.join("usage.jsonl"), since, |c: &ApiCall| c.ts)
+        .iter()
+        .filter(|c: &&ApiCall| c.purpose == "early" || c.purpose == "final")
+        .map(|c| c.usd)
+        .sum()
+}
+
 /// Shadow labels against what was pasted: (dictations, identical, words, words differing).
 fn shadow_agreement(state_dir: &Path, since: f64) -> (usize, usize, usize, usize) {
     let mut out = (0, 0, 0, 0);

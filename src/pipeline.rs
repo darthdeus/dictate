@@ -44,6 +44,9 @@ pub struct Ctx {
     /// Set by an incremental `stop`: the daemon's pause segments used and
     /// the seconds of audio after them recognized at stop (0: none).
     pub tail: std::cell::Cell<Option<(usize, f64)>>,
+    /// Who corrected the pasted text (`groq`, `cerebras`), or
+    /// `failed`; `None` when correction is off.
+    pub corrected_by: std::cell::RefCell<Option<String>>,
     /// What follows a dictation (`target`); `stop --sentence` sets
     /// `Sentence`.
     pub join: std::cell::Cell<Join>,
@@ -74,6 +77,7 @@ impl Ctx {
             command_started: now_unix(),
             timing_active: std::cell::Cell::new(false),
             tail: std::cell::Cell::new(None),
+            corrected_by: std::cell::RefCell::new(None),
             join: std::cell::Cell::new(Join::Paragraph),
         })
     }
@@ -861,10 +865,22 @@ fn notify_done(ctx: &Ctx, label: &str, raw: &str, text: &str, entry: Option<&Pat
     if let Some(ms) = span("correction_started", "correction_finished") {
         parts.push(format!("correction\t{:.2}\ts", ms / 1000.0));
     }
+    if let Some(via) = ctx.corrected_by.borrow().as_deref() {
+        parts.push(format!("corrected by\t{via}\t"));
+    }
+    // Every paid request since recording began, pause passes included.
+    let cost =
+        crate::usage::dictation_usd(&ctx.state_dir(), ctx.command_started - audio_secs - 1.0);
+    parts.push(format!("cost\t${cost:.4}\t"));
     if let Some(ms) = span("text_ready", "delivery_returned") {
         parts.push(format!("paste\t{:.2}\ts", ms / 1000.0));
     }
     parts.push(format!("audio\t{audio_secs:.1}\ts"));
+    // Progress towards a real fine-tuning run (~3 h of labelled audio).
+    let (total, labelled) =
+        crate::history::training_audio(&ctx.history.dir, &ctx.state_dir().join("bench"));
+    parts.push(format!("all audio\t{:.2}\th", total / 3600.0));
+    parts.push(format!("labelled\t{:.2} / 3\th", labelled / 3600.0));
     crate::usage::record_dictation(&ctx.state_dir(), &crate::usage::Dictation {
         ts: now_unix(),
         id: entry.and_then(|e| e.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1028,13 +1044,23 @@ fn transcribe_to_text(ctx: &Ctx, wav: &Path, entry: Option<&Path>, mode: &str, e
     }
 
     ctx.mark("correction_started");
-    let corrected = match early.and_then(|e| e.corrected.filter(|_| e.clean == text)) {
-        Some(fixed) => Some(Ok(fixed)),
+    let corrected = match early
+        .filter(|e| e.clean == text)
+        .and_then(|e| Some((e.corrected?, e.corrected_by)))
+    {
+        Some((fixed, via)) => Some(Ok(crate::correct::Corrected {
+            text: fixed,
+            via: via.unwrap_or_else(|| "pause pass".into()),
+        })),
         None => pass.correct(&text),
     };
     if let Some(corrected) = corrected {
+        *ctx.corrected_by.borrow_mut() = Some(match &corrected {
+            Ok(c) => c.via.clone(),
+            Err(_) => "failed".into(),
+        });
         match corrected {
-            Ok(fixed) => {
+            Ok(crate::correct::Corrected { text: fixed, .. }) => {
                 if fixed != text {
                     if let Some(e) = entry {
                         ctx.history.save_text(e, &fixed, "transcript.corrected.txt");
@@ -1082,6 +1108,9 @@ pub struct EarlyPass {
     /// `clean` when correction comes up (nothing rewrote it in between).
     pub clean: String,
     pub corrected: Option<String>,
+    /// The endpoint that made `corrected` (see `Corrected::via`).
+    #[serde(default)]
+    pub corrected_by: Option<String>,
     /// Samples covered: `None` (or the clip length) when the pass covers the
     /// whole clip, else `stop` recognizes `samples[until..]` and appends it.
     #[serde(default)]
@@ -1176,9 +1205,9 @@ impl FinalPass {
     }
 
     /// `None` when correction is off.
-    pub fn correct(&self, text: &str) -> Option<Result<String>> {
+    pub fn correct(&self, text: &str) -> Option<Result<crate::correct::Corrected>> {
         Some(match self.corrector.as_ref()? {
-            Ok(c) => c.correct(text),
+            Ok(c) => c.correct_via(text),
             Err(e) => Err(anyhow::anyhow!("{e}")),
         })
     }
