@@ -114,12 +114,13 @@ fn maybe_lower(word: &str, keep: &HashSet<String>) -> String {
 }
 
 fn replace_sentence_periods(text: &str) -> String {
-    // ". " -> " ... ", but not inside "a.b" (no space after).
+    // ". " -> " ... ", but preserve existing dot runs and "a.b".
     let mut out = String::with_capacity(text.len() + 8);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '.'
+            && (i == 0 || chars[i - 1] != '.')
             && i + 1 < chars.len()
             && chars[i + 1].is_whitespace()
         {
@@ -133,11 +134,13 @@ fn replace_sentence_periods(text: &str) -> String {
             i += 1;
         }
     }
-    // Drop trailing " ." / "." (final period, optional spaces).
+    // Drop a single sentence-final period, preserving existing ellipses.
     let trimmed = out.trim_end();
-    let without_final = trimmed.strip_suffix('.').unwrap_or(trimmed);
-    // Only strip if it was a sentence-final period, not "..." we inserted:
-    // inserted form ends with "... " pattern; a lone trailing '.' is dropped.
+    let without_final = if trimmed.ends_with("..") {
+        trimmed
+    } else {
+        trimmed.strip_suffix('.').unwrap_or(trimmed)
+    };
     if without_final != trimmed {
         without_final.trim_end().to_string()
     } else {
@@ -231,6 +234,24 @@ mod tests {
             restyle("Hello world. This is a test.", true, ""),
             "hello world ... this is a test"
         );
+    }
+
+    #[test]
+    fn existing_ellipses_survive_styling() {
+        // Real segmented dictations used to produce "get.. ... so.. ..."
+        // and truncate the final ellipsis to two dots.
+        assert_eq!(
+            restyle("How did we get... So... Much faster. So it's...", true, ""),
+            "how did we get... so... much faster ... so it's..."
+        );
+        assert_eq!(restyle("And ... then...", true, ""), "and ... then...");
+        assert_eq!(restyle("...", true, ""), "...");
+    }
+
+    #[test]
+    fn styling_does_not_expand_its_own_ellipses() {
+        let styled = restyle("Hello world. This is a test.", true, "");
+        assert_eq!(restyle(&styled, true, ""), styled);
     }
 
     #[test]
